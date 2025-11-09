@@ -930,7 +930,8 @@ def setup_cuda_environment():
     # Check for essential build tools
     try:
         g_version = subprocess.check_output(["g++", "--version"], text=True)
-        print(f"  ✓ g++ found: {g_version.split('\n')[0]}")
+        g_first_line = g_version.split('\n')[0]
+        print(f"  ✓ g++ found: {g_first_line}")
     except:
         print(f"  ✗ WARNING: g++ not found")
     
