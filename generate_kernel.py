@@ -28,20 +28,28 @@ import numpy as np
 
 app = modal.App("cuda-kernel-online-grpo")
 
+# Use official NVIDIA CUDA image with development tools
+# This matches KernelBench's approach and ensures proper CUDA environment
+cuda_version = "12.4.0"  # Compatible with most GPUs
+flavor = "devel"  # Includes full CUDA toolkit
+operating_sys = "ubuntu22.04"
+tag = f"{cuda_version}-{flavor}-{operating_sys}"
+
 # Build image with all dependencies
 image = (
-    modal.Image.debian_slim(python_version="3.11")
-    .run_commands("apt-get update")  # Update package lists first
+    modal.Image.from_registry(f"nvidia/cuda:{tag}", add_python="3.11")
     .apt_install(
         "git",
+        "gcc-10",
+        "g++-10",
         "build-essential",
-        "g++",
-        "gcc",
-        "make",
         "cmake",
         "ninja-build",
-        "python3-dev",
-        "libpython3.11-dev",
+    )
+    .run_commands(
+        # Set gcc-10 and g++-10 as default
+        "update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-10 100",
+        "update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-10 100",
     )
     .pip_install(
         "torch==2.7.0",
@@ -818,116 +826,56 @@ def extract_last_code(output_string: str, code_language_types: list[str]) -> str
 
 def setup_cuda_environment():
     """
-    Detect and set CUDA environment variables for compilation
+    Verify CUDA environment (should be pre-configured in NVIDIA image)
     
-    Modal GPU containers have CUDA installed, but CUDA_HOME may not be set.
-    This function finds CUDA and sets up the environment properly.
+    The NVIDIA CUDA base image comes with CUDA properly installed and configured.
+    This function just verifies everything is in place.
     """
     import glob
     
-    # Common CUDA installation paths
-    cuda_paths = [
-        "/usr/local/cuda",
-        "/usr/local/cuda-12.1",
-        "/usr/local/cuda-12.0",
-        "/usr/local/cuda-11.8",
-        "/opt/cuda",
-    ]
+    # CUDA_HOME should already be set by the NVIDIA image
+    cuda_home = os.environ.get("CUDA_HOME", "/usr/local/cuda")
     
-    # Try to find CUDA by looking for nvcc
-    cuda_home = None
-    for path in cuda_paths:
-        nvcc_path = os.path.join(path, "bin", "nvcc")
-        if os.path.exists(nvcc_path):
-            cuda_home = path
-            print(f"Found CUDA at: {cuda_home}")
-            break
-    
-    # If not found in standard paths, try to find via nvcc in PATH
-    if cuda_home is None:
-        try:
-            nvcc_output = subprocess.check_output(["which", "nvcc"], text=True).strip()
-            if nvcc_output:
-                # nvcc is at /path/to/cuda/bin/nvcc, so get parent twice
-                cuda_home = os.path.dirname(os.path.dirname(nvcc_output))
-                print(f"Found CUDA via nvcc: {cuda_home}")
-        except subprocess.CalledProcessError:
-            pass
-    
-    # If still not found, check if torch knows where CUDA is
-    if cuda_home is None:
-        try:
-            import torch
-            if torch.cuda.is_available():
-                # Try to get CUDA path from torch
-                torch_cuda_home = torch.utils.cpp_extension.CUDA_HOME
-                if torch_cuda_home and os.path.exists(torch_cuda_home):
-                    cuda_home = torch_cuda_home
-                    print(f"Found CUDA via torch: {cuda_home}")
-        except Exception as e:
-            print(f"Could not get CUDA path from torch: {e}")
-    
-    # Fallback to /usr/local/cuda
-    if cuda_home is None:
-        cuda_home = "/usr/local/cuda"
-        print(f"Warning: Could not detect CUDA installation, using default: {cuda_home}")
-    
-    # Set environment variables
-    os.environ["CUDA_HOME"] = cuda_home
-    os.environ["CUDA_PATH"] = cuda_home
-    
-    # Add CUDA bin and lib to PATH and LD_LIBRARY_PATH
-    cuda_bin = os.path.join(cuda_home, "bin")
-    cuda_lib64 = os.path.join(cuda_home, "lib64")
-    cuda_lib = os.path.join(cuda_home, "lib")
-    
-    if "PATH" in os.environ:
-        os.environ["PATH"] = f"{cuda_bin}:{os.environ['PATH']}"
-    else:
-        os.environ["PATH"] = cuda_bin
-    
-    if "LD_LIBRARY_PATH" in os.environ:
-        os.environ["LD_LIBRARY_PATH"] = f"{cuda_lib64}:{cuda_lib}:{os.environ['LD_LIBRARY_PATH']}"
-    else:
-        os.environ["LD_LIBRARY_PATH"] = f"{cuda_lib64}:{cuda_lib}"
-    
-    # Set additional environment variables for compilation
-    # Force use of system allocator instead of cudaMallocAsync (can cause issues)
-    os.environ["PYTORCH_NO_CUDA_MEMORY_CACHING"] = "0"
-    
-    # Set number of parallel compilation jobs
-    os.environ["MAX_JOBS"] = "4"
-    
-    # Enable verbose ninja output for debugging
-    os.environ["TORCH_CUDA_ARCH_LIST"] = "8.9"  # Ada architecture for L40S
-    
-    print(f"CUDA environment configured:")
-    print(f"  CUDA_HOME: {os.environ.get('CUDA_HOME')}")
-    print(f"  PATH includes: {cuda_bin}")
-    print(f"  LD_LIBRARY_PATH includes: {cuda_lib64}")
+    print(f"CUDA environment verification:")
+    print(f"  CUDA_HOME: {cuda_home}")
     
     # Verify critical components exist
     nvcc_path = os.path.join(cuda_home, "bin", "nvcc")
     if os.path.exists(nvcc_path):
         print(f"  ✓ nvcc found at {nvcc_path}")
-        # Try to get nvcc version
+        # Get nvcc version
         try:
             nvcc_version = subprocess.check_output([nvcc_path, "--version"], text=True)
-            version_line = [l for l in nvcc_version.split('\n') if 'release' in l.lower()]
-            if version_line:
-                print(f"  ✓ {version_line[0].strip()}")
+            version_lines = [l for l in nvcc_version.split('\n') if 'release' in l.lower()]
+            if version_lines:
+                version_line = version_lines[0].strip()
+                print(f"  ✓ {version_line}")
         except:
             pass
     else:
         print(f"  ✗ WARNING: nvcc not found at {nvcc_path}")
+        # Set CUDA_HOME if not found
+        print(f"  Attempting to locate CUDA...")
+        cuda_paths = ["/usr/local/cuda", "/usr/local/cuda-12.4", "/usr/local/cuda-12.1"]
+        for path in cuda_paths:
+            if os.path.exists(os.path.join(path, "bin", "nvcc")):
+                cuda_home = path
+                os.environ["CUDA_HOME"] = cuda_home
+                print(f"  ✓ Found CUDA at {cuda_home}")
+                break
     
+    # Ensure CUDA_HOME is set
+    if "CUDA_HOME" not in os.environ:
+        os.environ["CUDA_HOME"] = cuda_home
+    
+    # Verify headers
     cuda_runtime_h = os.path.join(cuda_home, "include", "cuda_runtime.h")
     if os.path.exists(cuda_runtime_h):
         print(f"  ✓ CUDA headers found")
     else:
-        print(f"  ✗ WARNING: CUDA headers not found at {cuda_home}/include")
+        print(f"  ✗ WARNING: CUDA headers not found")
     
-    # Check for essential build tools
+    # Check build tools
     try:
         g_version = subprocess.check_output(["g++", "--version"], text=True)
         g_first_line = g_version.split('\n')[0]
@@ -940,6 +888,17 @@ def setup_cuda_environment():
         print(f"  ✓ ninja found: version {ninja_version}")
     except:
         print(f"  ✗ WARNING: ninja not found")
+    
+    # Ensure PATH includes CUDA
+    cuda_bin = os.path.join(cuda_home, "bin")
+    if cuda_bin not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = f"{cuda_bin}:{os.environ.get('PATH', '')}"
+    
+    # Set compilation flags for L40S (Ada architecture)
+    os.environ["TORCH_CUDA_ARCH_LIST"] = "8.9"
+    os.environ["MAX_JOBS"] = "4"
+    
+    print(f"  ✓ Environment configured for CUDA compilation")
     
     return cuda_home
 
@@ -1111,21 +1070,22 @@ def train_online_grpo():
     setup_cuda_environment()
     
     # Test CUDA compilation before starting
-    if not test_cuda_compilation():
+    test_passed = test_cuda_compilation()
+    if test_passed:
         print("\n" + "="*80)
-        print("NOTE: Test compilation did not succeed")
+        print("✓ CUDA compilation test PASSED")
+        print("✓ Environment is properly configured")
+        print("✓ Ready to start training")
+        print("="*80 + "\n")
+    else:
+        print("\n" + "="*80)
+        print("⚠️  CUDA compilation test did not pass")
         print("")
-        print("This test uses PyTorch's cpp_extension which may have different")
-        print("requirements than KernelBench. Your actual kernel compilations may")
-        print("still work correctly.")
+        print("This is not necessarily a problem. The test uses torch.utils.cpp_extension")
+        print("which can be finicky, but KernelBench uses its own compilation pipeline.")
         print("")
-        print("Training will proceed normally. Watch the benchmark phase to see if")
-        print("generated kernels compile successfully.")
-        print("")
-        print("If you see persistent compilation failures:")
-        print("  1. Check CUDA_HOME is set correctly")
-        print("  2. Verify build-essential, g++, cmake are installed")
-        print("  3. Check that nvcc is in PATH")
+        print("Training will proceed. Watch Phase 2 (Benchmarking) to see if kernels")
+        print("compile successfully - that's the real test!")
         print("="*80 + "\n")
     
     import wandb
