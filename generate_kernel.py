@@ -6,17 +6,21 @@ Architecture: Generate kernels → Benchmark with KernelBench → Train with GRP
 
 This implements true online RL where the model improves between generation cycles,
 not supervised learning on a fixed dataset.
+
+Custom GRPO implementation without TRL dependency.
 """
 
 import modal
 import torch
+import torch.nn.functional as F
 from dataclasses import dataclass
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 import json
 import subprocess
 import tempfile
 import os
 import re
+import numpy as np
 
 # ============================================================================
 # MODAL SETUP
@@ -27,11 +31,21 @@ app = modal.App("cuda-kernel-online-grpo")
 # Build image with all dependencies
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .apt_install("git", "build-essential")
+    .run_commands("apt-get update")  # Update package lists first
+    .apt_install(
+        "git",
+        "build-essential",
+        "g++",
+        "gcc",
+        "make",
+        "cmake",
+        "ninja-build",
+        "python3-dev",
+        "libpython3.11-dev",
+    )
     .pip_install(
         "torch==2.7.0",
         "transformers==4.51.1",
-        "trl==0.19.1",
         "vllm==0.9.1",
         "datasets==3.5.1",
         "peft==0.15.0",
@@ -66,13 +80,12 @@ class TrainingConfig:
     # Online RL parameters
     num_training_iterations: int = 10  # How many generate-train cycles
     num_generations_per_iter: int = 4  # Completions per prompt per iteration
-    problems_per_iter: int = 16  # How many problems to sample each iteration
+    problems_per_iter: int = 8  # How many problems to sample each iteration (reduced for memory)
     
     # GRPO parameters
     learning_rate: float = 1e-6
-    grpo_epsilon: float = 0.2
-    grpo_beta: float = 0.0  # KL penalty coefficient
-    loss_type: str = "dapo"  # dapo, grpo, or dr_grpo
+    grpo_epsilon: float = 0.2  # Clipping parameter
+    grpo_beta: float = 0.01  # KL penalty coefficient
     
     # Generation parameters
     max_prompt_length: int = 1024
@@ -80,9 +93,10 @@ class TrainingConfig:
     temperature: float = 0.7
     
     # Training parameters
-    mini_epochs: int = 2  # How many gradient updates per generation batch
+    mini_epochs: int = 1  # Reduced to 1 for memory efficiency
     batch_size: int = 1
-    gradient_accumulation_steps: int = 8
+    gradient_accumulation_steps: int = 4  # Reduced from 8
+    max_grad_norm: float = 1.0
     
     # LoRA configuration
     lora_r: int = 64
@@ -97,6 +111,494 @@ class TrainingConfig:
     reward_correctness: float = 0.5
     reward_speedup: float = 0.3
     speedup_target: float = 2.0  # Normalize speedups to this value
+
+# ============================================================================
+# CUSTOM GRPO IMPLEMENTATION
+# ============================================================================
+
+class GRPOTrainer:
+    """
+    Custom Group Relative Policy Optimization Trainer
+    
+    GRPO is a variant of PPO designed for language models that:
+    1. Groups multiple completions per prompt
+    2. Computes advantages relative to the group mean
+    3. Uses clipped objective to prevent large updates
+    
+    Memory optimizations:
+    - Reference model stored on CPU, moved to GPU only when needed
+    - Batch processing for reference log probs
+    - Aggressive gradient checkpointing
+    """
+    
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        ref_model: torch.nn.Module,
+        tokenizer,
+        config: TrainingConfig,
+        optimizer: torch.optim.Optimizer,
+        device: torch.device
+    ):
+        self.model = model
+        self.ref_model = ref_model
+        self.tokenizer = tokenizer
+        self.config = config
+        self.optimizer = optimizer
+        self.device = device
+        
+        # Move reference model to CPU to save GPU memory
+        print("Moving reference model to CPU for memory efficiency...")
+        self.ref_model = self.ref_model.to('cpu')
+        self.ref_model.eval()
+        for param in self.ref_model.parameters():
+            param.requires_grad = False
+        
+        # Enable gradient checkpointing for policy model
+        if hasattr(self.model, 'gradient_checkpointing_enable'):
+            self.model.gradient_checkpointing_enable()
+            print("Enabled gradient checkpointing for policy model")
+    
+    def compute_log_probs(
+        self,
+        model: torch.nn.Module,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        labels: torch.Tensor,
+        batch_size: int = 1
+    ) -> torch.Tensor:
+        """
+        Compute log probabilities for generated tokens with batching
+        
+        Args:
+            model: Language model
+            input_ids: Full sequence (prompt + completion)
+            attention_mask: Attention mask for full sequence
+            labels: Labels with -100 for prompt tokens
+            batch_size: Process in mini-batches to save memory
+        
+        Returns:
+            log_probs: Log probabilities of generated tokens
+        """
+        all_log_probs = []
+        num_samples = input_ids.shape[0]
+        
+        for i in range(0, num_samples, batch_size):
+            end_idx = min(i + batch_size, num_samples)
+            batch_input_ids = input_ids[i:end_idx]
+            batch_attention_mask = attention_mask[i:end_idx]
+            batch_labels = labels[i:end_idx]
+            
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                outputs = model(
+                    input_ids=batch_input_ids,
+                    attention_mask=batch_attention_mask,
+                )
+                logits = outputs.logits
+            
+            # Shift logits and labels for next-token prediction
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = batch_labels[..., 1:].contiguous()
+            
+            # Compute log probabilities
+            log_probs = F.log_softmax(shift_logits, dim=-1)
+            
+            # IMPORTANT: Replace -100 with 0 before gather to avoid out-of-bounds
+            # The mask will zero these out anyway
+            shift_labels_safe = shift_labels.clone()
+            shift_labels_safe[shift_labels == -100] = 0
+            
+            # Clamp to valid range to prevent CUDA errors
+            vocab_size = log_probs.size(-1)
+            shift_labels_safe = torch.clamp(shift_labels_safe, 0, vocab_size - 1)
+            
+            # Gather log probs for actual tokens
+            token_log_probs = torch.gather(
+                log_probs,
+                dim=-1,
+                index=shift_labels_safe.unsqueeze(-1)
+            ).squeeze(-1)
+            
+            # Mask out prompt tokens (where labels == -100)
+            mask = (shift_labels != -100).float()
+            token_log_probs = token_log_probs * mask
+            
+            # Sum log probs per sequence
+            sequence_log_probs = token_log_probs.sum(dim=-1)
+            all_log_probs.append(sequence_log_probs)
+            
+            # Clear cache after each batch
+            del outputs, logits, shift_logits, log_probs, token_log_probs, shift_labels_safe
+            torch.cuda.empty_cache()
+        
+        return torch.cat(all_log_probs, dim=0)
+    
+    def compute_ref_log_probs(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        labels: torch.Tensor,
+        batch_size: int = 1
+    ) -> torch.Tensor:
+        """
+        Compute reference log probs with memory-efficient batching
+        
+        Temporarily moves ref model to GPU, processes in batches,
+        then moves back to CPU to save memory.
+        """
+        all_log_probs = []
+        num_samples = input_ids.shape[0]
+        
+        # Temporarily move ref model to GPU
+        print("  Moving reference model to GPU for log prob computation...")
+        self.ref_model = self.ref_model.to(self.device)
+        
+        try:
+            with torch.no_grad():
+                for i in range(0, num_samples, batch_size):
+                    end_idx = min(i + batch_size, num_samples)
+                    batch_input_ids = input_ids[i:end_idx]
+                    batch_attention_mask = attention_mask[i:end_idx]
+                    batch_labels = labels[i:end_idx]
+                    
+                    with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                        outputs = self.ref_model(
+                            input_ids=batch_input_ids,
+                            attention_mask=batch_attention_mask,
+                        )
+                        logits = outputs.logits
+                    
+                    # Shift logits and labels for next-token prediction
+                    shift_logits = logits[..., :-1, :].contiguous()
+                    shift_labels = batch_labels[..., 1:].contiguous()
+                    
+                    # Compute log probabilities
+                    log_probs = F.log_softmax(shift_logits, dim=-1)
+                    
+                    # IMPORTANT: Replace -100 with 0 before gather to avoid out-of-bounds
+                    # The mask will zero these out anyway
+                    shift_labels_safe = shift_labels.clone()
+                    shift_labels_safe[shift_labels == -100] = 0
+                    
+                    # Clamp to valid range to prevent CUDA errors
+                    vocab_size = log_probs.size(-1)
+                    shift_labels_safe = torch.clamp(shift_labels_safe, 0, vocab_size - 1)
+                    
+                    # Gather log probs for actual tokens
+                    token_log_probs = torch.gather(
+                        log_probs,
+                        dim=-1,
+                        index=shift_labels_safe.unsqueeze(-1)
+                    ).squeeze(-1)
+                    
+                    # Mask out prompt tokens and invalid tokens
+                    mask = (shift_labels != -100).float()
+                    token_log_probs = token_log_probs * mask
+                    
+                    # Sum log probs per sequence
+                    sequence_log_probs = token_log_probs.sum(dim=-1)
+                    
+                    # Move to CPU immediately to free GPU memory
+                    all_log_probs.append(sequence_log_probs.detach().cpu())
+                    
+                    # Clear cache after each batch
+                    del outputs, logits, shift_logits, log_probs, token_log_probs, shift_labels_safe
+                    torch.cuda.empty_cache()
+        
+        finally:
+            # Always move ref model back to CPU
+            print("  Moving reference model back to CPU...")
+            self.ref_model = self.ref_model.to('cpu')
+            torch.cuda.empty_cache()
+        
+        # Concatenate and move back to GPU
+        result = torch.cat(all_log_probs, dim=0).to(self.device)
+        return result
+    
+    def compute_advantages(
+        self,
+        rewards: torch.Tensor,
+        num_generations: int
+    ) -> torch.Tensor:
+        """
+        Compute group-relative advantages
+        
+        For each prompt, we have multiple completions.
+        Advantage is reward minus group mean reward.
+        
+        Args:
+            rewards: Tensor of shape (batch_size * num_generations,)
+            num_generations: Number of generations per prompt
+        
+        Returns:
+            advantages: Group-normalized advantages
+        """
+        # Reshape to (num_prompts, num_generations)
+        num_prompts = len(rewards) // num_generations
+        rewards_grouped = rewards.view(num_prompts, num_generations)
+        
+        # Compute group mean and std
+        group_mean = rewards_grouped.mean(dim=1, keepdim=True)
+        group_std = rewards_grouped.std(dim=1, keepdim=True) + 1e-8
+        
+        # Normalize advantages
+        advantages = (rewards_grouped - group_mean) / group_std
+        
+        # Flatten back
+        advantages = advantages.view(-1)
+        
+        return advantages
+    
+    def compute_grpo_loss(
+        self,
+        policy_log_probs: torch.Tensor,
+        ref_log_probs: torch.Tensor,
+        advantages: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Compute GRPO loss with clipping and KL penalty
+        
+        Args:
+            policy_log_probs: Log probs from current policy
+            ref_log_probs: Log probs from reference policy
+            advantages: Normalized advantages
+        
+        Returns:
+            loss: Scalar loss
+            stats: Dictionary of statistics
+        """
+        # Compute probability ratio
+        log_ratio = policy_log_probs - ref_log_probs
+        ratio = torch.exp(log_ratio)
+        
+        # Clipped surrogate objective
+        clipped_ratio = torch.clamp(
+            ratio,
+            1.0 - self.config.grpo_epsilon,
+            1.0 + self.config.grpo_epsilon
+        )
+        
+        # Policy loss
+        policy_loss_unclipped = -advantages * ratio
+        policy_loss_clipped = -advantages * clipped_ratio
+        policy_loss = torch.max(policy_loss_unclipped, policy_loss_clipped).mean()
+        
+        # KL divergence penalty (approximate)
+        kl_div = (ratio - 1.0 - log_ratio).mean()
+        
+        # Total loss
+        loss = policy_loss + self.config.grpo_beta * kl_div
+        
+        # Statistics
+        stats = {
+            "policy_loss": policy_loss.item(),
+            "kl_div": kl_div.item(),
+            "total_loss": loss.item(),
+            "ratio_mean": ratio.mean().item(),
+            "ratio_std": ratio.std().item(),
+            "advantages_mean": advantages.mean().item(),
+            "advantages_std": advantages.std().item(),
+        }
+        
+        return loss, stats
+    
+    def train_step(
+        self,
+        prompts: List[str],
+        completions: List[str],
+        rewards: List[float],
+    ) -> Dict[str, float]:
+        """
+        Single training step on a batch of data with memory optimizations
+        
+        Args:
+            prompts: List of prompts
+            completions: List of completions
+            rewards: List of rewards
+        
+        Returns:
+            stats: Training statistics
+        """
+        self.model.train()
+        
+        # Clear cache before starting
+        torch.cuda.empty_cache()
+        
+        # Tokenize prompts and full sequences
+        prompt_encodings = self.tokenizer(
+            prompts,
+            padding=True,
+            truncation=True,
+            max_length=self.config.max_prompt_length,
+            return_tensors="pt"
+        ).to(self.device)
+        
+        full_texts = [p + c for p, c in zip(prompts, completions)]
+        full_encodings = self.tokenizer(
+            full_texts,
+            padding=True,
+            truncation=True,
+            max_length=self.config.max_prompt_length + self.config.max_completion_length,
+            return_tensors="pt"
+        ).to(self.device)
+        
+        # Validate token IDs are within vocabulary
+        vocab_size = self.tokenizer.vocab_size
+        if full_encodings["input_ids"].max() >= vocab_size:
+            print(f"WARNING: Token IDs out of range! Max token: {full_encodings['input_ids'].max()}, Vocab size: {vocab_size}")
+            # Clamp to valid range
+            full_encodings["input_ids"] = torch.clamp(full_encodings["input_ids"], 0, vocab_size - 1)
+        
+        # Create labels (mask prompt tokens with -100)
+        labels = full_encodings["input_ids"].clone()
+        prompt_lengths = prompt_encodings["attention_mask"].sum(dim=1)
+        
+        for i, prompt_len in enumerate(prompt_lengths):
+            labels[i, :prompt_len] = -100
+        
+        # Validate labels
+        valid_label_mask = (labels >= 0) & (labels < vocab_size)
+        invalid_labels = (~valid_label_mask & (labels != -100)).sum().item()
+        if invalid_labels > 0:
+            print(f"WARNING: Found {invalid_labels} invalid label values (not -100 and not in vocab range)")
+            # Replace invalid labels with -100
+            labels[~valid_label_mask & (labels != -100)] = -100
+        
+        # Convert rewards to tensor
+        rewards_tensor = torch.tensor(rewards, dtype=torch.float32, device=self.device)
+        
+        # Compute advantages
+        advantages = self.compute_advantages(
+            rewards_tensor,
+            self.config.num_generations_per_iter
+        )
+        
+        # Compute reference log probs (memory-efficient with CPU offloading)
+        ref_log_probs = self.compute_ref_log_probs(
+            full_encodings["input_ids"],
+            full_encodings["attention_mask"],
+            labels,
+            batch_size=2  # Process 2 samples at a time for ref model
+        )
+        
+        # Clear cache after reference computation
+        torch.cuda.empty_cache()
+        
+        # Training loop with gradient accumulation
+        total_stats = {
+            "policy_loss": 0.0,
+            "kl_div": 0.0,
+            "total_loss": 0.0,
+            "ratio_mean": 0.0,
+            "ratio_std": 0.0,
+        }
+        
+        num_batches = max(1, len(prompts) // self.config.batch_size)
+        self.optimizer.zero_grad()
+        
+        for batch_idx in range(num_batches):
+            start_idx = batch_idx * self.config.batch_size
+            end_idx = min(start_idx + self.config.batch_size, len(prompts))
+            
+            # Get batch
+            batch_input_ids = full_encodings["input_ids"][start_idx:end_idx]
+            batch_attention_mask = full_encodings["attention_mask"][start_idx:end_idx]
+            batch_labels = labels[start_idx:end_idx]
+            batch_advantages = advantages[start_idx:end_idx]
+            batch_ref_log_probs = ref_log_probs[start_idx:end_idx]
+            
+            # Compute policy log probs
+            policy_log_probs = self.compute_log_probs(
+                self.model,
+                batch_input_ids,
+                batch_attention_mask,
+                batch_labels,
+                batch_size=1  # Process one at a time for policy model
+            )
+            
+            # Compute loss
+            loss, stats = self.compute_grpo_loss(
+                policy_log_probs,
+                batch_ref_log_probs,
+                batch_advantages
+            )
+            
+            # Scale loss for gradient accumulation
+            loss = loss / self.config.gradient_accumulation_steps
+            
+            # Backward pass
+            loss.backward()
+            
+            # Accumulate stats
+            for key in total_stats:
+                total_stats[key] += stats.get(key, 0.0)
+            
+            # Update weights
+            if (batch_idx + 1) % self.config.gradient_accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.config.max_grad_norm
+                )
+                self.optimizer.step()
+                self.optimizer.zero_grad()
+                
+                # Clear cache after optimizer step
+                torch.cuda.empty_cache()
+        
+        # Final optimizer step if there are remaining gradients
+        if num_batches % self.config.gradient_accumulation_steps != 0:
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(),
+                self.config.max_grad_norm
+            )
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+        
+        # Average stats
+        for key in total_stats:
+            total_stats[key] /= max(1, num_batches)
+        
+        # Clear cache at end
+        torch.cuda.empty_cache()
+        
+        return total_stats
+    
+    def train(
+        self,
+        prompts: List[str],
+        completions: List[str],
+        rewards: List[float],
+    ) -> Dict[str, List[float]]:
+        """
+        Train for multiple epochs on the same batch
+        
+        Args:
+            prompts: List of prompts
+            completions: List of completions  
+            rewards: List of rewards
+        
+        Returns:
+            history: Training history
+        """
+        history = {
+            "policy_loss": [],
+            "kl_div": [],
+            "total_loss": [],
+        }
+        
+        for epoch in range(self.config.mini_epochs):
+            stats = self.train_step(prompts, completions, rewards)
+            
+            print(f"  Epoch {epoch + 1}/{self.config.mini_epochs}")
+            print(f"    Loss: {stats['total_loss']:.4f}")
+            print(f"    Policy Loss: {stats['policy_loss']:.4f}")
+            print(f"    KL Div: {stats['kl_div']:.4f}")
+            
+            for key in history:
+                if key in stats:
+                    history[key].append(stats[key])
+        
+        return history
 
 # ============================================================================
 # KERNELBENCH INTEGRATION
@@ -144,6 +646,11 @@ def benchmark_kernel(
     """
     import torch
     import sys
+    import traceback
+    
+    # Set up CUDA environment for compilation
+    setup_cuda_environment()
+    
     sys.path.insert(0, '/root/KernelBench')
     from src.eval import eval_kernel_against_ref, get_torch_dtype_from_string
     from src.utils import set_gpu_arch
@@ -159,21 +666,32 @@ def benchmark_kernel(
         set_gpu_arch(["Ada"])
         device = torch.device("cuda:0")
 
-        # Combine reference code with test inputs
-        # KernelBench expects reference code to include Model and get_inputs
-
         # Use KernelBench's proper evaluation API
-        eval_result = eval_kernel_against_ref(
-            original_model_src=reference_code,
-            custom_model_src=kernel_code,
-            measure_performance=True,
-            verbose=False,
-            num_correct_trials=5,
-            num_perf_trials=10,
-            device=device,
-            backend="cuda",
-            precision=get_torch_dtype_from_string("fp32")
-        )
+        # Capture verbose output to get full error messages
+        import io
+        import contextlib
+        
+        # Redirect stderr to capture compilation errors
+        stderr_capture = io.StringIO()
+        
+        with contextlib.redirect_stderr(stderr_capture):
+            eval_result = eval_kernel_against_ref(
+                original_model_src=reference_code,
+                custom_model_src=kernel_code,
+                measure_performance=True,
+                verbose=True,  # Enable verbose to see compilation details
+                num_correct_trials=5,
+                num_perf_trials=10,
+                device=device,
+                backend="cuda",
+                precision=get_torch_dtype_from_string("fp32")
+            )
+        
+        # Get captured stderr
+        stderr_output = stderr_capture.getvalue()
+        if stderr_output:
+            print(f"Compilation output for problem {problem_id}:")
+            print(stderr_output[:1000])  # Print first 1000 chars
 
         # Map KernelBench result to our BenchmarkResult
         result.compiles = eval_result.compiled
@@ -181,8 +699,6 @@ def benchmark_kernel(
 
         if eval_result.correctness and eval_result.runtime is not None:
             # Calculate speedup from baseline and runtime
-            # eval_result contains runtime for the kernel
-            # We need to measure baseline time as well
             from scripts.generate_baseline_time import measure_program_time
 
             baseline_result = measure_program_time(
@@ -211,16 +727,26 @@ def benchmark_kernel(
                 result.error_message = eval_result.metadata['other_error']
             elif 'correctness_error' in eval_result.metadata:
                 result.error_message = eval_result.metadata['correctness_error']
+        
+        # Add stderr output to error message if compilation failed
+        if not result.compiles and stderr_output:
+            result.error_message = (result.error_message or "Compilation failed") + f"\n{stderr_output[:500]}"
 
         if not result.compiles:
             result.error_message = result.error_message or "Kernel compilation failed"
+            print(f"Problem {problem_id} failed to compile: {result.error_message[:200]}")
         elif not result.correct:
             result.error_message = result.error_message or "Kernel correctness check failed"
+            print(f"Problem {problem_id} incorrect: {result.error_message[:200]}")
+        else:
+            print(f"Problem {problem_id} SUCCESS: speedup={result.speedup:.2f}x")
 
         return result
 
     except Exception as e:
-        result.error_message = f"Unexpected error: {str(e)}"
+        error_trace = traceback.format_exc()
+        result.error_message = f"Unexpected error: {str(e)}\n{error_trace[:500]}"
+        print(f"Problem {problem_id} exception: {result.error_message}")
         return result
 
 def compute_fast_p(results: List[BenchmarkResult], p: float) -> float:
@@ -265,6 +791,7 @@ def compute_reward(result: BenchmarkResult, config: TrainingConfig) -> float:
         reward += config.reward_speedup * normalized_speedup
 
     return reward
+
 def extract_last_code(output_string: str, code_language_types: list[str]) -> str | None:
     """
     Extract last code block from model output, specified by code_language_type
@@ -288,6 +815,133 @@ def extract_last_code(output_string: str, code_language_types: list[str]) -> str
         return code
     
     return None
+
+def setup_cuda_environment():
+    """
+    Detect and set CUDA environment variables for compilation
+    
+    Modal GPU containers have CUDA installed, but CUDA_HOME may not be set.
+    This function finds CUDA and sets up the environment properly.
+    """
+    import glob
+    
+    # Common CUDA installation paths
+    cuda_paths = [
+        "/usr/local/cuda",
+        "/usr/local/cuda-12.1",
+        "/usr/local/cuda-12.0",
+        "/usr/local/cuda-11.8",
+        "/opt/cuda",
+    ]
+    
+    # Try to find CUDA by looking for nvcc
+    cuda_home = None
+    for path in cuda_paths:
+        nvcc_path = os.path.join(path, "bin", "nvcc")
+        if os.path.exists(nvcc_path):
+            cuda_home = path
+            print(f"Found CUDA at: {cuda_home}")
+            break
+    
+    # If not found in standard paths, try to find via nvcc in PATH
+    if cuda_home is None:
+        try:
+            nvcc_output = subprocess.check_output(["which", "nvcc"], text=True).strip()
+            if nvcc_output:
+                # nvcc is at /path/to/cuda/bin/nvcc, so get parent twice
+                cuda_home = os.path.dirname(os.path.dirname(nvcc_output))
+                print(f"Found CUDA via nvcc: {cuda_home}")
+        except subprocess.CalledProcessError:
+            pass
+    
+    # If still not found, check if torch knows where CUDA is
+    if cuda_home is None:
+        try:
+            import torch
+            if torch.cuda.is_available():
+                # Try to get CUDA path from torch
+                torch_cuda_home = torch.utils.cpp_extension.CUDA_HOME
+                if torch_cuda_home and os.path.exists(torch_cuda_home):
+                    cuda_home = torch_cuda_home
+                    print(f"Found CUDA via torch: {cuda_home}")
+        except Exception as e:
+            print(f"Could not get CUDA path from torch: {e}")
+    
+    # Fallback to /usr/local/cuda
+    if cuda_home is None:
+        cuda_home = "/usr/local/cuda"
+        print(f"Warning: Could not detect CUDA installation, using default: {cuda_home}")
+    
+    # Set environment variables
+    os.environ["CUDA_HOME"] = cuda_home
+    os.environ["CUDA_PATH"] = cuda_home
+    
+    # Add CUDA bin and lib to PATH and LD_LIBRARY_PATH
+    cuda_bin = os.path.join(cuda_home, "bin")
+    cuda_lib64 = os.path.join(cuda_home, "lib64")
+    cuda_lib = os.path.join(cuda_home, "lib")
+    
+    if "PATH" in os.environ:
+        os.environ["PATH"] = f"{cuda_bin}:{os.environ['PATH']}"
+    else:
+        os.environ["PATH"] = cuda_bin
+    
+    if "LD_LIBRARY_PATH" in os.environ:
+        os.environ["LD_LIBRARY_PATH"] = f"{cuda_lib64}:{cuda_lib}:{os.environ['LD_LIBRARY_PATH']}"
+    else:
+        os.environ["LD_LIBRARY_PATH"] = f"{cuda_lib64}:{cuda_lib}"
+    
+    # Set additional environment variables for compilation
+    # Force use of system allocator instead of cudaMallocAsync (can cause issues)
+    os.environ["PYTORCH_NO_CUDA_MEMORY_CACHING"] = "0"
+    
+    # Set number of parallel compilation jobs
+    os.environ["MAX_JOBS"] = "4"
+    
+    # Enable verbose ninja output for debugging
+    os.environ["TORCH_CUDA_ARCH_LIST"] = "8.9"  # Ada architecture for L40S
+    
+    print(f"CUDA environment configured:")
+    print(f"  CUDA_HOME: {os.environ.get('CUDA_HOME')}")
+    print(f"  PATH includes: {cuda_bin}")
+    print(f"  LD_LIBRARY_PATH includes: {cuda_lib64}")
+    
+    # Verify critical components exist
+    nvcc_path = os.path.join(cuda_home, "bin", "nvcc")
+    if os.path.exists(nvcc_path):
+        print(f"  ✓ nvcc found at {nvcc_path}")
+        # Try to get nvcc version
+        try:
+            nvcc_version = subprocess.check_output([nvcc_path, "--version"], text=True)
+            version_line = [l for l in nvcc_version.split('\n') if 'release' in l.lower()]
+            if version_line:
+                print(f"  ✓ {version_line[0].strip()}")
+        except:
+            pass
+    else:
+        print(f"  ✗ WARNING: nvcc not found at {nvcc_path}")
+    
+    cuda_runtime_h = os.path.join(cuda_home, "include", "cuda_runtime.h")
+    if os.path.exists(cuda_runtime_h):
+        print(f"  ✓ CUDA headers found")
+    else:
+        print(f"  ✗ WARNING: CUDA headers not found at {cuda_home}/include")
+    
+    # Check for essential build tools
+    try:
+        g_version = subprocess.check_output(["g++", "--version"], text=True)
+        print(f"  ✓ g++ found: {g_version.split('\n')[0]}")
+    except:
+        print(f"  ✗ WARNING: g++ not found")
+    
+    try:
+        ninja_version = subprocess.check_output(["ninja", "--version"], text=True).strip()
+        print(f"  ✓ ninja found: version {ninja_version}")
+    except:
+        print(f"  ✗ WARNING: ninja not found")
+    
+    return cuda_home
+
 # ============================================================================
 # PROMPT ENGINEERING
 # ============================================================================
@@ -306,6 +960,7 @@ def create_kernel_optimization_prompt(reference_code: str, iteration: int) -> st
         ref_arch_src=reference_code,
     )
     return prompt
+
 def read_file(file_path) -> str:
     if not os.path.exists(file_path):
         print(f"File {file_path} does not exist")
@@ -318,13 +973,113 @@ def read_file(file_path) -> str:
         print(f"Error reading file {file_path}: {e}")
         return ""
 
+def print_gpu_memory_summary(device_id: int = 1):
+    """Print current GPU memory usage"""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated(device_id) / 1024**3
+        reserved = torch.cuda.memory_reserved(device_id) / 1024**3
+        max_allocated = torch.cuda.max_memory_allocated(device_id) / 1024**3
+        print(f"GPU {device_id} Memory: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB, Peak={max_allocated:.2f}GB")
+
+def test_cuda_compilation():
+    """
+    Test that CUDA compilation works before starting training
+    
+    Returns True if compilation works, False otherwise
+    This is a best-effort test - failure doesn't necessarily mean training will fail
+    """
+    print("\nTesting CUDA compilation environment...")
+    
+    try:
+        import torch
+        import subprocess
+        from torch.utils.cpp_extension import load_inline
+        
+        # Simple test CUDA kernel
+        cuda_source = """
+        __global__ void add_kernel(float* a, float* b, float* c, int n) {
+            int idx = blockIdx.x * blockDim.x + threadIdx.x;
+            if (idx < n) {
+                c[idx] = a[idx] + b[idx];
+            }
+        }
+        """
+        
+        cpp_source = """
+        torch::Tensor add_cuda(torch::Tensor a, torch::Tensor b) {
+            auto c = torch::zeros_like(a);
+            int n = a.numel();
+            int threads = 256;
+            int blocks = (n + threads - 1) / threads;
+            add_kernel<<<blocks, threads>>>(
+                a.data_ptr<float>(),
+                b.data_ptr<float>(),
+                c.data_ptr<float>(),
+                n
+            );
+            return c;
+        }
+        """
+        
+        print("  Attempting to compile test kernel...")
+        print("  (This may take 30-60 seconds on first run...)")
+        
+        module = load_inline(
+            name='test_add',
+            cpp_sources=cpp_source,
+            cuda_sources=cuda_source,
+            functions=['add_cuda'],
+            verbose=False,  # Reduce noise
+            with_cuda=True,
+            extra_cuda_cflags=['-O2'],
+        )
+        
+        # Test execution
+        a = torch.randn(100, device='cuda')
+        b = torch.randn(100, device='cuda')
+        c = module.add_cuda(a, b)
+        
+        # Verify result
+        expected = a + b
+        if torch.allclose(c, expected, rtol=1e-5):
+            print("  ✓ Test kernel compiled and executed successfully!")
+            print("  ✓ CUDA compilation environment is working properly")
+            return True
+        else:
+            print("  ✗ Test kernel executed but results incorrect")
+            print("  ⚠️  This may indicate numerical issues")
+            return False
+            
+    except subprocess.CalledProcessError as e:
+        print(f"  ✗ Ninja build failed with exit code: {e.returncode}")
+        print(f"  ⚠️  This test uses torch.utils.cpp_extension")
+        print(f"  ⚠️  KernelBench may use a different compilation method")
+        print(f"  ➜  Training will continue - actual compilations may still work")
+        return False
+        
+    except RuntimeError as e:
+        error_str = str(e)
+        print(f"  ✗ Test compilation failed: {error_str[:200]}")
+        if "ninja" in error_str.lower():
+            print(f"  ⚠️  Ninja build system issue detected")
+            print(f"  ⚠️  This may not affect KernelBench compilation")
+        print(f"  ➜  Training will continue - watch for compilation errors")
+        return False
+        
+    except Exception as e:
+        print(f"  ✗ Unexpected error: {type(e).__name__}: {str(e)[:200]}")
+        print(f"  ➜  Training will continue")
+        import traceback
+        print(f"  Debug info: {traceback.format_exc()[:500]}")
+        return False
+
 # ============================================================================
 # ONLINE RL TRAINING LOOP
 # ============================================================================
 
 @app.function(
     gpu="L40S:2",  # 2 GPUs: one for generation (vLLM), one for training
-    timeout=86400,  #24 hours
+    timeout=86400,  # 24 hours
     secrets=[modal.Secret.from_name("wandb-secret")],
     volumes={
         "/checkpoints": checkpoint_vol,
@@ -345,11 +1100,37 @@ def train_online_grpo():
     6. Save checkpoint and metrics
     7. Repeat with improved model
     """
+    # Set CUDA memory optimization
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+    
+    # Enable synchronous CUDA execution for better error messages
+    os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+    
+    # Set up CUDA environment
+    setup_cuda_environment()
+    
+    # Test CUDA compilation before starting
+    if not test_cuda_compilation():
+        print("\n" + "="*80)
+        print("NOTE: Test compilation did not succeed")
+        print("")
+        print("This test uses PyTorch's cpp_extension which may have different")
+        print("requirements than KernelBench. Your actual kernel compilations may")
+        print("still work correctly.")
+        print("")
+        print("Training will proceed normally. Watch the benchmark phase to see if")
+        print("generated kernels compile successfully.")
+        print("")
+        print("If you see persistent compilation failures:")
+        print("  1. Check CUDA_HOME is set correctly")
+        print("  2. Verify build-essential, g++, cmake are installed")
+        print("  3. Check that nvcc is in PATH")
+        print("="*80 + "\n")
+    
     import wandb
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from peft import LoraConfig, get_peft_model, TaskType
-    from trl import GRPOConfig, GRPOTrainer
-    import numpy as np
+    import copy
     
     config = TrainingConfig()
     
@@ -357,7 +1138,7 @@ def train_online_grpo():
     wandb.init(
         project="cuda-kernel-grpo",
         config=config.__dict__,
-        name=f"online_grpo_{config.model_name.split('/')[-1]}"
+        name=f"online_grpo_custom_{config.model_name.split('/')[-1]}"
     )
     
     # Load base model
@@ -373,6 +1154,10 @@ def train_online_grpo():
         trust_remote_code=True
     )
     
+    # Ensure tokenizer has pad token
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
     # Apply LoRA for efficient training
     peft_config = LoraConfig(
         r=config.lora_r,
@@ -385,6 +1170,61 @@ def train_online_grpo():
     model = get_peft_model(model, peft_config)
     model.print_trainable_parameters()
     
+    # Enable gradient checkpointing for memory efficiency
+    if hasattr(model, 'gradient_checkpointing_enable'):
+        model.gradient_checkpointing_enable()
+        print("Enabled gradient checkpointing")
+    
+    print_gpu_memory_summary(1)
+    
+    # Create reference model on CPU (memory efficient)
+    print("Creating reference model on CPU...")
+    ref_model = AutoModelForCausalLM.from_pretrained(
+        config.model_name,
+        torch_dtype=torch.bfloat16,
+        device_map={"": "cpu"},  # Keep on CPU
+        trust_remote_code=True
+    )
+    ref_peft_config = LoraConfig(
+        r=config.lora_r,
+        lora_alpha=config.lora_alpha,
+        target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
+        lora_dropout=config.lora_dropout,
+        bias="none",
+        task_type=TaskType.CAUSAL_LM
+    )
+    ref_model = get_peft_model(ref_model, ref_peft_config)
+    
+    # Copy weights from policy model to reference model
+    print("Copying weights to reference model...")
+    ref_model.load_state_dict(model.state_dict())
+    ref_model.eval()
+    for param in ref_model.parameters():
+        param.requires_grad = False
+    
+    print(f"Reference model on: CPU (will be moved to GPU only during inference)")
+    print(f"Policy model on: GPU 1")
+    print_gpu_memory_summary(1)
+    
+    # Setup optimizer
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config.learning_rate,
+        betas=(0.9, 0.999),
+        weight_decay=0.01
+    )
+    
+    # Create GRPO trainer
+    device = torch.device("cuda:1")
+    grpo_trainer = GRPOTrainer(
+        model=model,
+        ref_model=ref_model,
+        tokenizer=tokenizer,
+        config=config,
+        optimizer=optimizer,
+        device=device
+    )
+    
     # Start vLLM server on GPU 0 for fast generation
     print("Starting vLLM server...")
     import time
@@ -392,31 +1232,27 @@ def train_online_grpo():
 
     vllm_env = os.environ.copy()
     vllm_env["CUDA_VISIBLE_DEVICES"] = "0"
-    # Stwórz pliki dla logów
     vllm_stdout_file = open("/tmp/vllm_stdout.log", "w")
     vllm_stderr_file = open("/tmp/vllm_stderr.log", "w")
 
     vllm_process = subprocess.Popen([
-    "python", "-m", "vllm.entrypoints.openai.api_server",
-    "--model", config.model_name,
-    "--gpu-memory-utilization", "0.7",  # ← Zmniejszone!
-    "--dtype", "bfloat16",
-    "--max-model-len", "4096",  # ← Zmniejszone!
-    "--port", "8000",
-    "--tensor-parallel-size", "1",
-    
-    # NOWE - limitują obciążenie:
-    "--max-num-seqs", "4",
-    "--max-num-batched-tokens", "8192",
-    "--disable-log-requests",  # Mniej I/O
-    "--enforce-eager",  # Wyłącza CUDA graphs (bardziej stabilne)
+        "python", "-m", "vllm.entrypoints.openai.api_server",
+        "--model", config.model_name,
+        "--gpu-memory-utilization", "0.7",
+        "--dtype", "bfloat16",
+        "--max-model-len", "4096",
+        "--port", "8000",
+        "--tensor-parallel-size", "1",
+        "--max-num-seqs", "4",
+        "--max-num-batched-tokens", "8192",
+        "--disable-log-requests",
+        "--enforce-eager",
     ],
     env=vllm_env,
     stdout=vllm_stdout_file,
     stderr=vllm_stderr_file,
     text=True
     )
-
 
     # Wait for vLLM to be ready with health check
     print("Waiting for vLLM server to be ready...")
@@ -436,20 +1272,15 @@ def train_online_grpo():
 
         # Check if process died
         if vllm_process.poll() is not None:
-            stdout, stderr = vllm_process.communicate()
             print(f"vLLM process died! Exit code: {vllm_process.returncode}")
-            print(f"STDOUT: {stdout}")
-            print(f"STDERR: {stderr}")
+            print(f"Check logs at /tmp/vllm_stdout.log and /tmp/vllm_stderr.log")
             raise RuntimeError("vLLM server failed to start")
 
         time.sleep(2)
 
     if not server_ready:
         vllm_process.terminate()
-        stdout, stderr = vllm_process.communicate(timeout=5)
         print(f"vLLM server failed to start within {max_wait}s")
-        print(f"STDOUT: {stdout}")
-        print(f"STDERR: {stderr}")
         raise RuntimeError("vLLM server startup timeout")
     
     # Load KernelBench problems
@@ -476,19 +1307,17 @@ def train_online_grpo():
         all_references = []
         all_problem_ids = []
         
-
-
         from openai import OpenAI
         client = OpenAI(
             base_url="http://localhost:8000/v1",
             api_key="dummy",
-            timeout=120.0,  # 2 minute timeout for API calls
-            max_retries=2  # Retry up to 2 times on connection errors
+            timeout=120.0,
+            max_retries=2
         )
 
         for problem in problem_indices:
             problem_name = os.path.basename(problem)
-            ref_arch_src =read_file(problem)
+            ref_arch_src = read_file(problem)
             problem_number = int(problem_name.split("_")[0])
             prompt = create_kernel_optimization_prompt(
                 ref_arch_src,
@@ -499,17 +1328,14 @@ def train_online_grpo():
             for gen_idx in range(config.num_generations_per_iter):
                 print(f"Generating candidate {gen_idx + 1}/{config.num_generations_per_iter} for problem {problem_number}...")
                 try:
-                    try:
-                        response = client.completions.create(
-                            model=config.model_name,
-                            prompt=prompt,
-                            max_tokens=config.max_completion_length,
-                            temperature=config.temperature,
-                            n=1
-                        )
-                    except Exception as e:
-                        print(f"Generation error for problem {problem_number} (candidate {gen_idx + 1}): {e}")
-                        continue
+                    response = client.completions.create(
+                        model=config.model_name,
+                        prompt=prompt,
+                        max_tokens=config.max_completion_length,
+                        temperature=config.temperature,
+                        n=1
+                    )
+                    
                     completion = response.choices[0].text
                     code = extract_last_code(completion, ["python", "cpp"])
                     if code is None:
@@ -517,27 +1343,42 @@ def train_online_grpo():
                         print(f"Warning: No code extracted for problem {problem_number} (candidate {gen_idx + 1})")
                     else:
                         print(f"Generated code for problem {problem_number} (candidate {gen_idx + 1})\n")
-                    all_completions.append(code)
+                    
+                    all_completions.append(completion)  # Store full completion for training
                     all_prompts.append(prompt)
                     all_references.append(ref_arch_src)
                     all_problem_ids.append(problem_number)
+                    
                 except Exception as e:
-                    print(f"Unexpected error during generation for problem {problem_number} (candidate {gen_idx + 1}): {e}")
-                    continue
+                    print(f"Generation error for problem {problem_number} (candidate {gen_idx + 1}): {e}")
+                    # Add empty completion to maintain structure
+                    all_completions.append("")
+                    all_prompts.append(prompt)
+                    all_references.append(ref_arch_src)
+                    all_problem_ids.append(problem_number)
         
         print(f"Generated {len(all_completions)} kernel candidates")
+        
+        # Clear CUDA cache before benchmarking
+        torch.cuda.empty_cache()
         
         # Phase 2: BENCHMARKING
         print("Phase 2: Benchmarking kernels in parallel...")
         
+        # Extract code for benchmarking
+        all_codes = [extract_last_code(comp, ["python", "cpp"]) or "" for comp in all_completions]
+        
         # Parallel benchmark execution
         benchmark_results = list(benchmark_kernel.starmap(
             zip(
-                all_completions,
+                all_codes,
                 all_references,
                 all_problem_ids
             )
         ))
+        
+        # Clear cache after benchmarking
+        torch.cuda.empty_cache()
         
         # Compute rewards
         rewards = [compute_reward(result, config) for result in benchmark_results]
@@ -563,6 +1404,19 @@ def train_online_grpo():
         print(f"  Fast_p Metrics:")
         for p in fast_p_thresholds:
             print(f"    fast_p@{p}: {fast_p_scores[f'fast_p_{p}']:.3f}")
+        
+        # Warning if compilation rate is very low
+        if num_compiled == 0:
+            print("\n" + "!"*80)
+            print("WARNING: No kernels compiled successfully in this iteration!")
+            print("This is normal in early training, but check:")
+            print("  1. Generated code format (should be in code blocks)")
+            print("  2. CUDA compilation environment (run test_cuda_compilation)")
+            print("  3. Model prompt (ensure it's asking for CUDA code)")
+            print("!"*80 + "\n")
+        elif num_compiled < len(all_completions) * 0.1:  # Less than 10% compile
+            print(f"\nNote: Low compilation rate ({100*num_compiled/len(all_completions):.1f}%)")
+            print("This may improve as the model learns from GRPO feedback.\n")
 
         wandb.log({
             "iteration": iteration,
@@ -571,62 +1425,51 @@ def train_online_grpo():
             "avg_speedup": avg_speedup,
             "avg_reward": np.mean(rewards),
             "reward_std": np.std(rewards),
-            **fast_p_scores,  # Add all fast_p scores
+            **fast_p_scores,
         })
         
         # Phase 3: GRPO TRAINING
-        print("Phase 3: Training model with GRPO...")
+        print("Phase 3: Training model with custom GRPO...")
+        print_gpu_memory_summary(1)
         
-        # Prepare training data
-        from datasets import Dataset
-        
-        train_data = {
-            "prompt": all_prompts,
-            "completion": all_completions,
-            "reward": rewards,
-        }
-        train_dataset = Dataset.from_dict(train_data)
-        
-        # GRPO configuration for this mini-training
-        grpo_config = GRPOConfig(
-            output_dir=f"/checkpoints/iter_{iteration}",
-            num_train_epochs=config.mini_epochs,
-            per_device_train_batch_size=config.batch_size,
-            gradient_accumulation_steps=config.gradient_accumulation_steps,
-            learning_rate=config.learning_rate,
-            
-            # GRPO parameters
-            num_generations=config.num_generations_per_iter,
-            epsilon=config.grpo_epsilon,
-            beta=config.grpo_beta,
-            loss_type=config.loss_type,
-            
-            # Optimization
-            gradient_checkpointing=True,
-            bf16=True,
-            
-            # Logging
-            logging_steps=1,
-            report_to=["wandb"],
-            save_steps=999999,  # Don't auto-save, we'll do it manually
+        # Train with custom GRPO trainer
+        training_history = grpo_trainer.train(
+            prompts=all_prompts,
+            completions=all_completions,
+            rewards=rewards
         )
         
-        # Create trainer (note: we're using pre-generated completions)
-        trainer = GRPOTrainer(
-            model=model,
-            args=grpo_config,
-            train_dataset=train_dataset,
-            processing_class=tokenizer,
-        )
+        print_gpu_memory_summary(1)
         
-        # Train on this batch
-        trainer.train()
+        # Log training stats
+        wandb.log({
+            "iteration": iteration,
+            "train/policy_loss": np.mean(training_history["policy_loss"]),
+            "train/kl_div": np.mean(training_history["kl_div"]),
+            "train/total_loss": np.mean(training_history["total_loss"]),
+        })
+        
+        # Update reference model to current policy periodically
+        if (iteration + 1) % 5 == 0:
+            print("Updating reference model...")
+            # Move ref model to CPU if it's on GPU
+            if next(ref_model.parameters()).device.type == 'cuda':
+                ref_model = ref_model.to('cpu')
+            
+            # Copy state dict
+            ref_model.load_state_dict(model.state_dict())
+            ref_model.eval()
+            
+            # Clear CUDA cache
+            torch.cuda.empty_cache()
+            print("Reference model updated and moved to CPU")
         
         # Phase 4: CHECKPOINTING
         if (iteration + 1) % config.save_every_n_iters == 0:
             checkpoint_path = f"/checkpoints/iteration_{iteration+1}"
             print(f"Saving checkpoint to {checkpoint_path}")
-            trainer.save_model(checkpoint_path)
+            model.save_pretrained(checkpoint_path)
+            tokenizer.save_pretrained(checkpoint_path)
             checkpoint_vol.commit()
             
             # Save metrics
@@ -636,8 +1479,12 @@ def train_online_grpo():
                 "correctness_rate": num_correct / len(all_completions),
                 "avg_speedup": avg_speedup,
                 "avg_reward": np.mean(rewards),
-                "speedup_distribution": speedups[:100],  # Sample for storage
-                "fast_p_scores": fast_p_scores,  # Include fast_p metrics
+                "speedup_distribution": speedups[:100],
+                "fast_p_scores": fast_p_scores,
+                "training_history": {
+                    k: [float(v) for v in vals]
+                    for k, vals in training_history.items()
+                }
             }
 
             with open(f"/results/metrics_iter_{iteration+1}.json", "w") as f:
@@ -646,7 +1493,8 @@ def train_online_grpo():
     
     # Final save
     print("\nTraining complete! Saving final model...")
-    trainer.save_model("/checkpoints/final_model")
+    model.save_pretrained("/checkpoints/final_model")
+    tokenizer.save_pretrained("/checkpoints/final_model")
     checkpoint_vol.commit()
     
     # Cleanup
@@ -715,11 +1563,11 @@ def main(action: str = "train"):
     Entry point for the application
     
     Usage:
-        modal run cuda_kernel_online_grpo.py --action train
-        modal run cuda_kernel_online_grpo.py --action optimize --code "..."
+        modal run cuda_kernel_online_grpo_custom.py --action train
+        modal run cuda_kernel_online_grpo_custom.py --action optimize
     """
     if action == "train":
-        print("Starting online GRPO training...")
+        print("Starting online GRPO training with custom implementation...")
         train_online_grpo.remote()
     
     elif action == "optimize":
