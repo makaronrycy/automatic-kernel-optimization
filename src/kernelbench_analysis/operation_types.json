@@ -1,0 +1,169 @@
+{
+  "kernel_operations": {
+    "gemm_matrix_operations": {
+      "description": "General Matrix Multiplication and related operations",
+      "files": [
+        "1_Square_matrix_multiplication_.py",
+        "2_Standard_matrix_multiplication_.py",
+        "3_Batched_matrix_multiplication.py",
+        "4_Matrix_vector_multiplication_.py",
+        "5_Matrix_scalar_multiplication.py",
+        "6_Matmul_with_large_K_dimension_.py",
+        "7_Matmul_with_small_K_dimension_.py",
+        "8_Matmul_with_irregular_shapes_.py",
+        "9_Tall_skinny_matrix_multiplication_.py",
+        "10_3D_tensor_matrix_multiplication.py",
+        "11_4D_tensor_matrix_multiplication.py",
+        "12_Matmul_with_diagonal_matrices_.py",
+        "13_Matmul_for_symmetric_matrices.py",
+        "14_Matmul_for_upper_triangular_matrices.py",
+        "15_Matmul_for_lower_triangular_matrices.py",
+        "16_Matmul_with_transposed_A.py",
+        "17_Matmul_with_transposed_B.py",
+        "18_Matmul_with_transposed_both.py"
+      ]
+    },
+    "activation_functions": {
+      "description": "Neural network activation functions",
+      "files": [
+        "19_ReLU.py",
+        "20_LeakyReLU.py",
+        "21_Sigmoid.py",
+        "22_Tanh.py",
+        "23_Softmax.py",
+        "24_LogSoftmax.py",
+        "25_Swish.py",
+        "26_GELU_.py",
+        "27_SELU_.py",
+        "28_HardSigmoid.py",
+        "29_Softplus.py",
+        "30_Softsign.py",
+        "31_ELU.py",
+        "32_HardTanh.py",
+        "88_MinGPTNewGelu.py"
+      ]
+    },
+    "normalization_operations": {
+      "description": "Normalization layers and operations",
+      "files": [
+        "33_BatchNorm.py",
+        "34_InstanceNorm.py",
+        "35_GroupNorm_.py",
+        "36_RMSNorm_.py",
+        "37_FrobeniusNorm_.py",
+        "38_L1Norm_.py",
+        "39_L2Norm_.py",
+        "40_LayerNorm.py"
+      ]
+    },
+    "pooling_operations": {
+      "description": "Pooling layers for dimensionality reduction",
+      "files": [
+        "41_Max_Pooling_1D.py",
+        "42_Max_Pooling_2D.py",
+        "43_Max_Pooling_3D.py",
+        "44_Average_Pooling_1D.py",
+        "45_Average_Pooling_2D.py",
+        "46_Average_Pooling_3D.py"
+      ]
+    },
+    "reduction_operations": {
+      "description": "Tensor reduction operations",
+      "files": [
+        "47_Sum_reduction_over_a_dimension.py",
+        "48_Mean_reduction_over_a_dimension.py",
+        "49_Max_reduction_over_a_dimension.py",
+        "51_Argmax_over_a_dimension.py",
+        "52_Argmin_over_a_dimension.py",
+        "53_Min_reduction_over_a_dimension.py"
+      ]
+    },
+    "convolution_operations": {
+      "description": "Convolution operations for spatial feature extraction",
+      "subcategories": {
+        "standard_convolutions": [
+          "50_conv_standard_2D__square_input__square_kernel.py",
+          "54_conv_standard_3D__square_input__square_kernel.py",
+          "55_conv_standard_2D__asymmetric_input__square_kernel.py",
+          "56_conv_standard_2D__asymmetric_input__asymmetric_kernel.py",
+          "59_conv_standard_3D__asymmetric_input__square_kernel.py",
+          "60_conv_standard_3D__square_input__asymmetric_kernel.py",
+          "62_conv_standard_2D__square_input__asymmetric_kernel.py",
+          "63_conv_standard_2D__square_input__square_kernel.py",
+          "66_conv_standard_3D__asymmetric_input__asymmetric_kernel.py",
+          "67_conv_standard_1D.py",
+          "76_conv_standard_1D_dilated_strided__.py",
+          "80_conv_standard_2D_square_input_asymmetric_kernel___dilated____padded__.py"
+        ],
+        "transposed_convolutions": [
+          "57_conv_transposed_2D__square_input__square_kernel.py",
+          "58_conv_transposed_3D__asymmetric_input__asymmetric_kernel.py",
+          "61_conv_transposed_3D__square_input__square_kernel.py",
+          "64_conv_transposed_1D.py",
+          "65_conv_transposed_2D__square_input__asymmetric_kernel.py",
+          "68_conv_transposed_3D__square_input__asymmetric_kernel.py",
+          "69_conv_transposed_2D__asymmetric_input__asymmetric_kernel.py",
+          "70_conv_transposed_3D__asymmetric_input__square_kernel.py",
+          "71_conv_transposed_2D__asymmetric_input__square_kernel.py",
+          "72_conv_transposed_3D_asymmetric_input_asymmetric_kernel___strided_padded_grouped_.py",
+          "73_conv_transposed_3D_asymmetric_input_square_kernel__strided_padded__grouped.py",
+          "74_conv_transposed_1D_dilated.py",
+          "75_conv_transposed_2D_asymmetric_input_asymmetric_kernel_strided__grouped____padded____dilated__.py",
+          "77_conv_transposed_3D_square_input_square_kernel___padded____dilated____strided__.py",
+          "78_conv_transposed_2D_asymmetric_input_asymmetric_kernel___padded__.py",
+          "79_conv_transposed_1D_asymmetric_input_square_kernel___padded____strided____dilated__.py",
+          "81_conv_transposed_2D_asymmetric_input_square_kernel___dilated____padded____strided__.py"
+        ],
+        "depthwise_and_special_convolutions": [
+          "82_conv_depthwise_2D_square_input_square_kernel.py",
+          "83_conv_depthwise_2D_square_input_asymmetric_kernel.py",
+          "84_conv_depthwise_2D_asymmetric_input_square_kernel.py",
+          "85_conv_depthwise_2D_asymmetric_input_asymmetric_kernel.py",
+          "86_conv_depthwise_separable_2D.py",
+          "87_conv_pointwise_2D.py"
+        ]
+      }
+    },
+    "cumulative_operations": {
+      "description": "Cumulative sum and product operations",
+      "files": [
+        "89_cumsum.py",
+        "90_cumprod.py",
+        "91_cumsum_reverse.py",
+        "92_cumsum_exclusive.py",
+        "93_masked_cumsum.py"
+      ]
+    },
+    "loss_functions": {
+      "description": "Loss functions for training neural networks",
+      "files": [
+        "94_MSELoss.py",
+        "95_CrossEntropyLoss.py",
+        "96_HuberLoss.py",
+        "98_KLDivLoss.py",
+        "99_TripletMarginLoss.py",
+        "100_HingeLoss.py"
+      ]
+    },
+    "attention_mechanisms": {
+      "description": "Attention operations for sequence modeling",
+      "files": [
+        "97_ScaledDotProductAttention.py"
+      ]
+    }
+  },
+  "summary": {
+    "total_files": 100,
+    "categories": {
+      "gemm_matrix_operations": 18,
+      "activation_functions": 15,
+      "normalization_operations": 8,
+      "pooling_operations": 6,
+      "reduction_operations": 6,
+      "convolution_operations": 38,
+      "cumulative_operations": 5,
+      "loss_functions": 6,
+      "attention_mechanisms": 1
+    }
+  }
+}

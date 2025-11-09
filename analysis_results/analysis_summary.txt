@@ -1,0 +1,70 @@
+================================================================================
+KERNELBENCH LEVEL 1 OPERATIONS ANALYSIS REPORT
+================================================================================
+
+Generated: 2025-10-21T15:04:42.501437
+Total Operations Analyzed: 100
+
+--------------------------------------------------------------------------------
+CATEGORY SUMMARY
+--------------------------------------------------------------------------------
+
+gemm_matrix_operations:
+  Operations: 18
+  Total Memory: 3581.68 MB
+
+activation_functions:
+  Operations: 15
+  Total Memory: 256.00 MB
+
+normalization_operations:
+  Operations: 8
+  Total Memory: 256.00 MB
+
+pooling_operations:
+  Operations: 6
+  Total Memory: 4096.00 MB
+
+reduction_operations:
+  Operations: 6
+  Total Memory: 0.00 MB
+
+convolution_operations:
+  Operations: 35
+  Total Memory: 15696.50 MB
+
+cumulative_operations:
+  Operations: 5
+  Total Memory: 0.00 MB
+
+loss_functions:
+  Operations: 6
+  Total Memory: 512.25 MB
+
+attention_mechanisms:
+  Operations: 1
+  Total Memory: 3072.00 MB
+
+--------------------------------------------------------------------------------
+FP32 STATISTICS
+--------------------------------------------------------------------------------
+Total Memory Usage: 26.83 GB
+Total Tensors: 68
+Avg Memory per Operation: 274.70 MB
+
+Dimension Distribution:
+  1D tensors: 2
+  2D tensors: 27
+  3D tensors: 6
+  4D tensors: 22
+  5D tensors: 11
+
+--------------------------------------------------------------------------------
+MEMORY ACCESS PATTERNS
+--------------------------------------------------------------------------------
+Transpose: 4 operations
+Reshape: 0 operations
+Permute: 0 operations
+Contiguous: 0 operations
+Indexing: 100 operations
+Batching: 86 operations

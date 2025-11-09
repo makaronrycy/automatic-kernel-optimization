@@ -1,0 +1,16 @@
+# PyTorch with CUDA 12.8 support
+--index-url https://download.pytorch.org/whl/cu128
+torch
+torchvision
+torchaudio
+
+# Core dependencies
+numpy
+matplotlib
+psutil
+
+triton
+
+# Modal and API clients
+modal
+openai
