@@ -178,6 +178,8 @@ class GRPOTrainer:
         """
         Compute log probabilities for generated tokens with batching
         
+        NOTE: Assumes model is in correct mode (train/eval) - doesn't change it
+        
         Args:
             model: Language model
             input_ids: Full sequence (prompt + completion)
@@ -186,7 +188,7 @@ class GRPOTrainer:
             batch_size: Process in mini-batches to save memory
         
         Returns:
-            log_probs: Log probabilities of generated tokens
+            log_probs: Log probabilities of generated tokens (with gradients if model.training)
         """
         all_log_probs = []
         num_samples = input_ids.shape[0]
@@ -197,7 +199,9 @@ class GRPOTrainer:
             batch_attention_mask = attention_mask[i:end_idx]
             batch_labels = labels[i:end_idx]
             
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+            # Use autocast but ensure it doesn't break gradients
+            # enabled=True keeps gradients flowing
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=True):
                 outputs = model(
                     input_ids=batch_input_ids,
                     attention_mask=batch_attention_mask,
@@ -208,7 +212,7 @@ class GRPOTrainer:
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = batch_labels[..., 1:].contiguous()
             
-            # Compute log probabilities
+            # Compute log probabilities (this should maintain gradients)
             log_probs = F.log_softmax(shift_logits, dim=-1)
             
             # IMPORTANT: Replace -100 with 0 before gather to avoid out-of-bounds
@@ -233,13 +237,20 @@ class GRPOTrainer:
             
             # Sum log probs per sequence
             sequence_log_probs = token_log_probs.sum(dim=-1)
+            
+            # Important: Don't detach here - we need gradients for policy model
             all_log_probs.append(sequence_log_probs)
             
-            # Clear cache after each batch
-            del outputs, logits, shift_logits, log_probs, token_log_probs, shift_labels_safe
-            torch.cuda.empty_cache()
+            # Clear intermediate tensors but not log probs (need gradients!)
+            del outputs, shift_logits, shift_labels_safe, mask
+            if i < num_samples - batch_size:
+                torch.cuda.empty_cache()
         
-        return torch.cat(all_log_probs, dim=0)
+        # Concatenate results - this maintains gradients
+        if len(all_log_probs) == 1:
+            return all_log_probs[0]
+        else:
+            return torch.cat(all_log_probs, dim=0)
     
     def compute_ref_log_probs(
         self,
@@ -397,16 +408,21 @@ class GRPOTrainer:
         # Total loss
         loss = policy_loss + self.config.grpo_beta * kl_div
         
-        # Statistics
-        stats = {
-            "policy_loss": policy_loss.item(),
-            "kl_div": kl_div.item(),
-            "total_loss": loss.item(),
-            "ratio_mean": ratio.mean().item(),
-            "ratio_std": ratio.std().item(),
-            "advantages_mean": advantages.mean().item(),
-            "advantages_std": advantages.std().item(),
-        }
+        # Statistics (detach for logging to avoid grad issues)
+        with torch.no_grad():
+            # Handle single-element tensors for std
+            ratio_std = ratio.std().item() if ratio.numel() > 1 else 0.0
+            advantages_std = advantages.std().item() if advantages.numel() > 1 else 0.0
+            
+            stats = {
+                "policy_loss": policy_loss.item(),
+                "kl_div": kl_div.item(),
+                "total_loss": loss.item(),
+                "ratio_mean": ratio.mean().item(),
+                "ratio_std": ratio_std,
+                "advantages_mean": advantages.mean().item(),
+                "advantages_std": advantages_std,
+            }
         
         return loss, stats
     
@@ -427,7 +443,13 @@ class GRPOTrainer:
         Returns:
             stats: Training statistics
         """
+        # CRITICAL: Ensure model is in training mode
         self.model.train()
+        
+        # Verify model has trainable parameters
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        if not trainable_params:
+            raise RuntimeError("Model has no trainable parameters! Check LoRA configuration.")
         
         # Clear cache before starting
         torch.cuda.empty_cache()
@@ -524,6 +546,34 @@ class GRPOTrainer:
                 batch_size=1  # Process one at a time for policy model
             )
             
+            # Debug: Check if gradients are enabled
+            if not policy_log_probs.requires_grad:
+                print(f"ERROR: policy_log_probs does not require grad!")
+                print(f"  Model training mode: {self.model.training}")
+                print(f"  Batch size: {end_idx - start_idx}")
+                print(f"  Input IDs shape: {batch_input_ids.shape}")
+                print(f"  Input IDs device: {batch_input_ids.device}")
+                print(f"  Input IDs requires_grad: {batch_input_ids.requires_grad}")
+                
+                # Check model parameters
+                trainable_params = sum(1 for p in self.model.parameters() if p.requires_grad)
+                total_params = sum(1 for p in self.model.parameters())
+                print(f"  Trainable params: {trainable_params}/{total_params}")
+                
+                # Check if base model has gradient checkpointing enabled
+                if hasattr(self.model, 'is_gradient_checkpointing'):
+                    print(f"  Gradient checkpointing: {self.model.is_gradient_checkpointing}")
+                
+                # Try to trace back through computation
+                print(f"  policy_log_probs grad_fn: {policy_log_probs.grad_fn}")
+                print(f"  policy_log_probs is_leaf: {policy_log_probs.is_leaf}")
+                
+                raise RuntimeError(
+                    "Policy log probs do not require grad. "
+                    "This suggests gradients were detached somewhere in the computation. "
+                    "Check that gradient checkpointing is disabled and model is in training mode."
+                )
+            
             # Compute loss
             loss, stats = self.compute_grpo_loss(
                 policy_log_probs,
@@ -531,11 +581,26 @@ class GRPOTrainer:
                 batch_advantages
             )
             
+            # Check loss has gradients
+            if not loss.requires_grad:
+                print(f"WARNING: loss does not require grad!")
+                print(f"  policy_log_probs.requires_grad: {policy_log_probs.requires_grad}")
+                print(f"  batch_ref_log_probs.requires_grad: {batch_ref_log_probs.requires_grad}")
+                print(f"  batch_advantages.requires_grad: {batch_advantages.requires_grad}")
+                raise RuntimeError("Loss does not require grad. Cannot backpropagate.")
+            
             # Scale loss for gradient accumulation
             loss = loss / self.config.gradient_accumulation_steps
             
             # Backward pass
-            loss.backward()
+            try:
+                loss.backward()
+            except RuntimeError as e:
+                print(f"Error during backward pass: {e}")
+                print(f"Loss value: {loss.item()}")
+                print(f"Loss requires_grad: {loss.requires_grad}")
+                print(f"Batch size: {end_idx - start_idx}")
+                raise
             
             # Accumulate stats
             for key in total_stats:
@@ -1114,7 +1179,8 @@ def train_online_grpo():
         config.model_name,
         trust_remote_code=True
     )
-    
+    if hasattr(model, 'enable_input_require_grads'):
+        model.enable_input_require_grads()
     # Ensure tokenizer has pad token
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -1126,15 +1192,34 @@ def train_online_grpo():
         target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
         lora_dropout=config.lora_dropout,
         bias="none",
-        task_type=TaskType.CAUSAL_LM
+        task_type=TaskType.CAUSAL_LM,
+        # Important for gradient flow
+        inference_mode=False,  # Must be False for training
     )
     model = get_peft_model(model, peft_config)
     model.print_trainable_parameters()
     
-    # Enable gradient checkpointing for memory efficiency
-    if hasattr(model, 'gradient_checkpointing_enable'):
-        model.gradient_checkpointing_enable()
-        print("Enabled gradient checkpointing")
+    # Verify LoRA is configured correctly
+    print(f"LoRA configuration:")
+    print(f"  inference_mode: {peft_config.inference_mode}")
+    print(f"  r: {peft_config.r}")
+    print(f"  alpha: {peft_config.lora_alpha}")
+    
+    ## Gradient checkpointing can interfere with RL training
+    ## Disable it for now to ensure proper gradient flow
+    #if hasattr(model, 'gradient_checkpointing_disable'):
+    #    model.gradient_checkpointing_disable()
+    #    print("Gradient checkpointing disabled for GRPO training")
+        
+    
+    # Verify model has trainable parameters
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    print(f"Trainable parameters: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
+    
+    # Set model to training mode explicitly
+    model.train()
+    print(f"Model training mode: {model.training}")
     
     print_gpu_memory_summary(1)
     
