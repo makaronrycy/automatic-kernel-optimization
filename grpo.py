@@ -45,6 +45,7 @@ image = (
         "build-essential",
         "cmake",
         "ninja-build",
+
     )
     .run_commands(
         # Set gcc-10 and g++-10 as default
@@ -63,6 +64,7 @@ image = (
         "litellm",
         "openai",
         "requests",
+        "func-timeout",
     )
     .run_commands(
         "git clone https://github.com/ScalingIntelligence/KernelBench /root/KernelBench",
@@ -83,17 +85,17 @@ class TrainingConfig:
     """Online GRPO training configuration"""
     
     # Model
-    model_name: str = "Qwen/Qwen2.5-7B-Instruct"
+    model_name: str = "Qwen/Qwen2.5-Coder-7B-Instruct"
     
     # Online RL parameters
-    num_training_iterations: int = 10  # How many generate-train cycles
-    num_generations_per_iter: int = 4  # Completions per prompt per iteration
-    problems_per_iter: int = 8  # How many problems to sample each iteration (reduced for memory)
+    num_training_iterations: int = 50  # How many generate-train cycles
+    num_generations_per_iter: int = 5  # Completions per prompt per iteration (reduced to prevent OOM)
+    problems_per_iter: int = 6  # How many problems to sample each iteration (30 total samples)
     
     # GRPO parameters
     learning_rate: float = 1e-6
     grpo_epsilon: float = 0.2  # Clipping parameter
-    grpo_beta: float = 0.01  # KL penalty coefficient
+    grpo_beta: float = 0.1  # KL penalty coefficient (increased from 0.01 to prevent divergence)
     
     # Generation parameters
     max_prompt_length: int = 1024
@@ -109,16 +111,18 @@ class TrainingConfig:
     # LoRA configuration
     lora_r: int = 64
     lora_alpha: int = 64
-    lora_dropout: float = 0.05
+    lora_dropout: float = 0.0  # CHANGED: Disabled dropout to prevent NaN with bfloat16
     
     # Checkpointing
     save_every_n_iters: int = 10
-    
+    load_checkpoint: int = 10  # Load checkpoint from this iteration, or None
     # Reward weights
     reward_compilation: float = 0.2
     reward_correctness: float = 0.5
     reward_speedup: float = 0.3
     speedup_target: float = 2.0  # Normalize speedups to this value
+
+
 
 # ============================================================================
 # CUSTOM GRPO IMPLEMENTATION
@@ -146,7 +150,8 @@ class GRPOTrainer:
         tokenizer,
         config: TrainingConfig,
         optimizer: torch.optim.Optimizer,
-        device: torch.device
+        device: torch.device,
+        vocab_size: int  # Added for proper token validation
     ):
         self.model = model
         self.ref_model = ref_model
@@ -154,6 +159,7 @@ class GRPOTrainer:
         self.config = config
         self.optimizer = optimizer
         self.device = device
+        self.vocab_size = vocab_size  # Store vocab size for token validation
         
         # Move reference model to CPU to save GPU memory
         print("Moving reference model to CPU for memory efficiency...")
@@ -163,10 +169,10 @@ class GRPOTrainer:
             param.requires_grad = False
         
         # Enable gradient checkpointing for policy model
-        if hasattr(self.model, 'gradient_checkpointing_enable'):
-            self.model.gradient_checkpointing_enable()
-            print("Enabled gradient checkpointing for policy model")
-    
+        #if hasattr(self.model, 'gradient_checkpointing_enable'):
+        #    self.model.gradient_checkpointing_enable()
+        #    print("Enabled gradient checkpointing for policy model")
+    #
     def compute_log_probs(
         self,
         model: torch.nn.Module,
@@ -177,76 +183,127 @@ class GRPOTrainer:
     ) -> torch.Tensor:
         """
         Compute log probabilities for generated tokens with batching
-        
+
         NOTE: Assumes model is in correct mode (train/eval) - doesn't change it
-        
+
         Args:
             model: Language model
             input_ids: Full sequence (prompt + completion)
             attention_mask: Attention mask for full sequence
             labels: Labels with -100 for prompt tokens
             batch_size: Process in mini-batches to save memory
-        
+
         Returns:
             log_probs: Log probabilities of generated tokens (with gradients if model.training)
         """
         all_log_probs = []
         num_samples = input_ids.shape[0]
-        
+
+        # Determine if this is the policy model (needs gradients) or ref model
+        use_autocast = not model.training
+
         for i in range(0, num_samples, batch_size):
             end_idx = min(i + batch_size, num_samples)
             batch_input_ids = input_ids[i:end_idx]
             batch_attention_mask = attention_mask[i:end_idx]
             batch_labels = labels[i:end_idx]
-            
-            # Use autocast but ensure it doesn't break gradients
-            # enabled=True keeps gradients flowing
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=True):
-                outputs = model(
-                    input_ids=batch_input_ids,
-                    attention_mask=batch_attention_mask,
-                )
-                logits = outputs.logits
-            
+
+            # Validate inputs before forward pass to prevent NaN
+            if torch.isnan(batch_input_ids.float()).any():
+                raise RuntimeError("NaN in input_ids before forward pass!")
+            if (batch_input_ids < 0).any() or (batch_input_ids >= self.vocab_size).any():
+                max_id = batch_input_ids.max().item()
+                min_id = batch_input_ids.min().item()
+                print(f"ERROR: Token IDs out of range [{min_id}, {max_id}], vocab_size={self.vocab_size}")
+                # Clamp to valid range
+                batch_input_ids = torch.clamp(batch_input_ids, 0, self.vocab_size - 1)
+                print(f"  Clamped to valid range")
+
+            # CRITICAL FIX: Only use autocast for eval mode (reference model)
+            # For training mode (policy model), disable autocast to prevent NaN
+            if use_autocast:
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=True):
+                    outputs = model(
+                        input_ids=batch_input_ids,
+                        attention_mask=batch_attention_mask,
+                    )
+                    logits = outputs.logits
+            else:
+                # Training mode: NO autocast - compute in model's native dtype (bfloat16)
+                # This prevents NaN issues that can occur with bfloat16 + LoRA + autocast
+                with torch.cuda.amp.autocast(enabled=False):
+                    outputs = model(
+                        input_ids=batch_input_ids,
+                        attention_mask=batch_attention_mask,
+                    )
+                    logits = outputs.logits
+
+            # Check for NaN in logits immediately after forward pass
+            if torch.isnan(logits).any() or torch.isinf(logits).any():
+                print(f"ERROR: NaN/Inf detected in logits after forward pass!")
+                print(f"  Model training mode: {model.training}")
+                print(f"  Logits dtype: {logits.dtype}")
+                print(f"  Logits stats: min={logits.min()}, max={logits.max()}")
+                print(f"  NaN count: {torch.isnan(logits).sum().item()}")
+                print(f"  Inf count: {torch.isinf(logits).sum().item()}")
+
+                # Try to identify which token positions have NaN
+                nan_positions = torch.isnan(logits).any(dim=-1)
+                print(f"  Sequences with NaN: {nan_positions.sum(dim=-1)}")
+
+                raise RuntimeError("NaN/Inf in model output - training cannot continue")
+
             # Shift logits and labels for next-token prediction
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = batch_labels[..., 1:].contiguous()
-            
-            # Compute log probabilities (this should maintain gradients)
-            log_probs = F.log_softmax(shift_logits, dim=-1)
-            
+
+            # Cast to float32 for numerical stability in log_softmax
+            shift_logits_fp32 = shift_logits.float()
+
+            # Compute log probabilities in float32
+            log_probs = F.log_softmax(shift_logits_fp32, dim=-1)
+
+            # Check for NaN after log_softmax
+            if torch.isnan(log_probs).any():
+                print("ERROR: NaN appeared in log_softmax computation!")
+                raise RuntimeError("NaN in log_softmax")
+
             # IMPORTANT: Replace -100 with 0 before gather to avoid out-of-bounds
-            # The mask will zero these out anyway
             shift_labels_safe = shift_labels.clone()
             shift_labels_safe[shift_labels == -100] = 0
-            
-            # Clamp to valid range to prevent CUDA errors
-            vocab_size = log_probs.size(-1)
-            shift_labels_safe = torch.clamp(shift_labels_safe, 0, vocab_size - 1)
-            
+
+            # Clamp to valid range using actual vocab size
+            shift_labels_safe = torch.clamp(shift_labels_safe, 0, self.vocab_size - 1)
+
             # Gather log probs for actual tokens
             token_log_probs = torch.gather(
                 log_probs,
                 dim=-1,
                 index=shift_labels_safe.unsqueeze(-1)
             ).squeeze(-1)
-            
+
             # Mask out prompt tokens (where labels == -100)
             mask = (shift_labels != -100).float()
             token_log_probs = token_log_probs * mask
-            
-            # Sum log probs per sequence
-            sequence_log_probs = token_log_probs.sum(dim=-1)
-            
-            # Important: Don't detach here - we need gradients for policy model
-            all_log_probs.append(sequence_log_probs)
-            
-            # Clear intermediate tensors but not log probs (need gradients!)
-            del outputs, shift_logits, shift_labels_safe, mask
+
+            # CRITICAL FIX: Normalize by sequence length to prevent explosion
+            # Sum log probs and divide by number of tokens (average per token)
+            num_tokens = mask.sum(dim=-1)  # Count non-masked tokens
+            sequence_log_probs = token_log_probs.sum(dim=-1) / (num_tokens + 1e-8)
+
+            # For training mode, keep on GPU with gradients
+            # For eval mode, move to CPU
+            if model.training:
+                all_log_probs.append(sequence_log_probs)
+            else:
+                all_log_probs.append(sequence_log_probs.detach())
+
+            # Clear intermediate tensors
+            del outputs, logits, shift_logits, shift_labels_safe, mask
             if i < num_samples - batch_size:
                 torch.cuda.empty_cache()
-        
-        # Concatenate results - this maintains gradients
+
+        # Concatenate results
         if len(all_log_probs) == 1:
             return all_log_probs[0]
         else:
@@ -268,10 +325,28 @@ class GRPOTrainer:
         all_log_probs = []
         num_samples = input_ids.shape[0]
         
+        # Check available GPU memory before moving ref model
+        if torch.cuda.is_available():
+            free_mem = torch.cuda.get_device_properties(self.device).total_memory
+            allocated = torch.cuda.memory_allocated(self.device)
+            free_mem_gb = (free_mem - allocated) / 1024**3
+            print(f"  Available GPU memory: {free_mem_gb:.2f}GB")
+
+            if free_mem_gb < 10.0:
+                print(f"  WARNING: Low GPU memory ({free_mem_gb:.2f}GB). Clearing cache...")
+                torch.cuda.empty_cache()
+                import gc
+                gc.collect()
+
         # Temporarily move ref model to GPU
         print("  Moving reference model to GPU for log prob computation...")
-        self.ref_model = self.ref_model.to(self.device)
-        
+        try:
+            self.ref_model = self.ref_model.to(self.device)
+        except RuntimeError as e:
+            print(f"  ERROR: Failed to move ref model to GPU: {e}")
+            print(f"  This likely means GPU is out of memory")
+            raise RuntimeError(f"OOM when moving reference model to GPU. Reduce batch size.") from e
+
         try:
             with torch.no_grad():
                 for i in range(0, num_samples, batch_size):
@@ -279,29 +354,61 @@ class GRPOTrainer:
                     batch_input_ids = input_ids[i:end_idx]
                     batch_attention_mask = attention_mask[i:end_idx]
                     batch_labels = labels[i:end_idx]
-                    
-                    with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                        outputs = self.ref_model(
-                            input_ids=batch_input_ids,
-                            attention_mask=batch_attention_mask,
-                        )
-                        logits = outputs.logits
+
+                    # CRITICAL: Use same precision as policy model for consistency
+                    # Policy model disables autocast to prevent NaN, so ref model should too
+                    try:
+                        with torch.cuda.amp.autocast(enabled=False):
+                            outputs = self.ref_model(
+                                input_ids=batch_input_ids,
+                                attention_mask=batch_attention_mask,
+                            )
+                            logits = outputs.logits
+                    except RuntimeError as e:
+                        error_msg = str(e)
+                        if "out of memory" in error_msg.lower():
+                            print(f"  ERROR: GPU OOM during reference model forward pass!")
+                            print(f"  Batch: {i//batch_size + 1}/{(num_samples + batch_size - 1)//batch_size}")
+                            print(f"  Batch size: {end_idx - i}")
+                            print(f"  Sequence length: {batch_input_ids.shape[1]}")
+                            raise RuntimeError(f"OOM in reference model. Reduce problems_per_iter or num_generations_per_iter") from e
+                        else:
+                            print(f"  ERROR: CUDA error in reference model forward pass: {error_msg}")
+                            raise
                     
                     # Shift logits and labels for next-token prediction
                     shift_logits = logits[..., :-1, :].contiguous()
                     shift_labels = batch_labels[..., 1:].contiguous()
                     
-                    # Compute log probabilities
-                    log_probs = F.log_softmax(shift_logits, dim=-1)
+                    # CRITICAL: Cast to float32 for numerical stability
+                    # bfloat16 can cause NaN in log_softmax due to overflow/underflow
+                    shift_logits_fp32 = shift_logits.float()
+                    
+                    # Check for NaN/Inf in logits BEFORE log_softmax
+                    if torch.isnan(shift_logits_fp32).any():
+                        print("ERROR: NaN detected in logits before log_softmax!")
+                        print(f"  NaN count: {torch.isnan(shift_logits_fp32).sum().item()}")
+                        print(f"  Logits stats: min={shift_logits_fp32.min()}, max={shift_logits_fp32.max()}")
+                    if torch.isinf(shift_logits_fp32).any():
+                        print("ERROR: Inf detected in logits before log_softmax!")
+                        print(f"  Inf count: {torch.isinf(shift_logits_fp32).sum().item()}")
+                        print(f"  Logits stats: min={shift_logits_fp32.min()}, max={shift_logits_fp32.max()}")
+                    
+                    # Compute log probabilities in float32 for stability
+                    log_probs = F.log_softmax(shift_logits_fp32, dim=-1)
+                    
+                    # Check for NaN after log_softmax
+                    if torch.isnan(log_probs).any():
+                        print("ERROR: NaN in log_probs after log_softmax!")
+                        print(f"  This suggests numerical instability in the forward pass")
                     
                     # IMPORTANT: Replace -100 with 0 before gather to avoid out-of-bounds
                     # The mask will zero these out anyway
                     shift_labels_safe = shift_labels.clone()
                     shift_labels_safe[shift_labels == -100] = 0
                     
-                    # Clamp to valid range to prevent CUDA errors
-                    vocab_size = log_probs.size(-1)
-                    shift_labels_safe = torch.clamp(shift_labels_safe, 0, vocab_size - 1)
+                    # Clamp to valid range using actual vocab size
+                    shift_labels_safe = torch.clamp(shift_labels_safe, 0, self.vocab_size - 1)
                     
                     # Gather log probs for actual tokens
                     token_log_probs = torch.gather(
@@ -313,9 +420,11 @@ class GRPOTrainer:
                     # Mask out prompt tokens and invalid tokens
                     mask = (shift_labels != -100).float()
                     token_log_probs = token_log_probs * mask
-                    
-                    # Sum log probs per sequence
-                    sequence_log_probs = token_log_probs.sum(dim=-1)
+
+                    # CRITICAL FIX: Normalize by sequence length (same as policy model)
+                    # Average per token to prevent explosion with different sequence lengths
+                    num_tokens = mask.sum(dim=-1)  # Count non-masked tokens
+                    sequence_log_probs = token_log_probs.sum(dim=-1) / (num_tokens + 1e-8)
                     
                     # Move to CPU immediately to free GPU memory
                     all_log_probs.append(sequence_log_probs.detach().cpu())
@@ -334,39 +443,57 @@ class GRPOTrainer:
         result = torch.cat(all_log_probs, dim=0).to(self.device)
         return result
     
-    def compute_advantages(
+    def compute_advantages_robust(
         self,
         rewards: torch.Tensor,
-        num_generations: int
+        num_generations: int,
+        epsilon: float = 1e-4  # Increased from 1e-8 for stability
     ) -> torch.Tensor:
         """
-        Compute group-relative advantages
-        
-        For each prompt, we have multiple completions.
-        Advantage is reward minus group mean reward.
-        
-        Args:
-            rewards: Tensor of shape (batch_size * num_generations,)
-            num_generations: Number of generations per prompt
-        
-        Returns:
-            advantages: Group-normalized advantages
+        Compute group-relative advantages with robust handling of edge cases
+
+        Improvements:
+        1. Larger epsilon for numerical stability
+        2. Add small noise if all rewards identical
+        3. Clip extreme advantages
         """
         # Reshape to (num_prompts, num_generations)
         num_prompts = len(rewards) // num_generations
         rewards_grouped = rewards.view(num_prompts, num_generations)
-        
+
         # Compute group mean and std
         group_mean = rewards_grouped.mean(dim=1, keepdim=True)
-        group_std = rewards_grouped.std(dim=1, keepdim=True) + 1e-8
-        
+        group_std = rewards_grouped.std(dim=1, keepdim=True)
+
+        # Check for zero variance (all rewards identical in a group)
+        zero_std_mask = group_std < epsilon
+
+        if zero_std_mask.any():
+            print(f"  Warning: {zero_std_mask.sum().item()} groups have identical rewards")
+            print(f"  Adding small noise for numerical stability...")
+
+            # Add small random noise to rewards where std is zero
+            noise = torch.randn_like(rewards_grouped) * 0.01
+            rewards_grouped = rewards_grouped + noise * zero_std_mask.float()
+
+            # Recompute statistics
+            group_mean = rewards_grouped.mean(dim=1, keepdim=True)
+            group_std = rewards_grouped.std(dim=1, keepdim=True)
+
+        # Add epsilon for stability
+        group_std = group_std + epsilon
+
         # Normalize advantages
         advantages = (rewards_grouped - group_mean) / group_std
-        
+
+        # Clip extreme advantages to prevent instability
+        advantages = torch.clamp(advantages, -10.0, 10.0)
+
         # Flatten back
         advantages = advantages.view(-1)
-        
+
         return advantages
+
     
     def compute_grpo_loss(
         self,
@@ -386,10 +513,44 @@ class GRPOTrainer:
             loss: Scalar loss
             stats: Dictionary of statistics
         """
-        # Compute probability ratio
-        log_ratio = policy_log_probs - ref_log_probs
-        ratio = torch.exp(log_ratio)
         
+        # Debug: Check for NaN/Inf in inputs
+        if torch.isnan(policy_log_probs).any():
+            print("ERROR: NaN in policy_log_probs!")
+            print(f"  policy_log_probs stats: min={policy_log_probs.min()}, max={policy_log_probs.max()}")
+        if torch.isnan(ref_log_probs).any():
+            print("ERROR: NaN in ref_log_probs!")
+            print(f"  ref_log_probs stats: min={ref_log_probs.min()}, max={ref_log_probs.max()}")
+        if torch.isnan(advantages).any():
+            print("ERROR: NaN in advantages!")
+            print(f"  advantages stats: min={advantages.min()}, max={advantages.max()}")
+
+        # Compute probability ratio with clipping to prevent overflow
+        log_ratio = policy_log_probs - ref_log_probs
+
+        # CRITICAL FIX: Much tighter clipping to prevent loss explosion
+        # With per-token averaging, log_ratio should be close to 0 in healthy training
+        # exp(5) = 148, exp(-5) = 0.0067 - this is already a very large policy change
+        # Original [-20, 20] allowed exp(20) = 485M which caused the loss explosion
+        log_ratio_clipped = torch.clamp(log_ratio, -5.0, 5.0)
+
+        # Debug: Check if clipping was needed
+        if (log_ratio.abs() > 5.0).any():
+            print(f"WARNING: Extreme log_ratio detected (clipped to [-5, 5])!")
+            print(f"  log_ratio stats: min={log_ratio.min():.2f}, max={log_ratio.max():.2f}")
+            print(f"  Number of extreme values: {(log_ratio.abs() > 5.0).sum().item()}")
+            print(f"  policy_log_probs: min={policy_log_probs.min():.2f}, max={policy_log_probs.max():.2f}")
+            print(f"  ref_log_probs: min={ref_log_probs.min():.2f}, max={ref_log_probs.max():.2f}")
+            print(f"  This suggests policy and reference models are diverging!")
+
+        ratio = torch.exp(log_ratio_clipped)
+
+        # Additional safety: Check ratio range
+        if ratio.max() > 100 or ratio.min() < 0.01:
+            print(f"WARNING: Extreme ratio values detected!")
+            print(f"  ratio stats: min={ratio.min():.4f}, max={ratio.max():.4f}, mean={ratio.mean():.4f}")
+            print(f"  This indicates policy has changed significantly from reference")
+
         # Clipped surrogate objective
         clipped_ratio = torch.clamp(
             ratio,
@@ -401,13 +562,30 @@ class GRPOTrainer:
         policy_loss_unclipped = -advantages * ratio
         policy_loss_clipped = -advantages * clipped_ratio
         policy_loss = torch.max(policy_loss_unclipped, policy_loss_clipped).mean()
-        
-        # KL divergence penalty (approximate)
-        kl_div = (ratio - 1.0 - log_ratio).mean()
+
+        # KL divergence penalty (approximate) using clipped values
+        # KL(p||q) ≈ ratio - 1 - log(ratio) where ratio = p/q
+        kl_div = (ratio - 1.0 - log_ratio_clipped).mean()
+
+        # Additional safety: clip KL divergence to prevent explosion
+        # Typical KL values should be < 10 in well-behaved training
+        kl_div = torch.clamp(kl_div, -10.0, 10.0)
         
         # Total loss
         loss = policy_loss + self.config.grpo_beta * kl_div
-        
+
+        # CRITICAL: Sanity check for extreme loss values
+        if loss.abs() > 100.0:
+            print(f"❌ ERROR: Extreme loss detected: {loss.item():.2f}")
+            print(f"  policy_loss: {policy_loss.item():.2f}")
+            print(f"  kl_div: {kl_div.item():.2f}")
+            print(f"  ratio range: [{ratio.min():.4f}, {ratio.max():.4f}]")
+            print(f"  advantages range: [{advantages.min():.4f}, {advantages.max():.4f}]")
+            print(f"  This should not happen with the fixes applied!")
+            # Don't raise error - let training continue with clipped loss
+            loss = torch.clamp(loss, -100.0, 100.0)
+            print(f"  Clamped loss to: {loss.item():.2f}")
+
         # Statistics (detach for logging to avoid grad issues)
         with torch.no_grad():
             # Handle single-element tensors for std
@@ -473,11 +651,13 @@ class GRPOTrainer:
         ).to(self.device)
         
         # Validate token IDs are within vocabulary
-        vocab_size = self.tokenizer.vocab_size
-        if full_encodings["input_ids"].max() >= vocab_size:
-            print(f"WARNING: Token IDs out of range! Max token: {full_encodings['input_ids'].max()}, Vocab size: {vocab_size}")
+        if full_encodings["input_ids"].max() >= self.vocab_size:
+            max_token = full_encodings["input_ids"].max().item()
+            num_bad = (full_encodings["input_ids"] >= self.vocab_size).sum().item()
+            print(f"WARNING: Token IDs out of range! Max token: {max_token}, Vocab size: {self.vocab_size}")
+            print(f"  Clamping {num_bad} tokens to valid range")
             # Clamp to valid range
-            full_encodings["input_ids"] = torch.clamp(full_encodings["input_ids"], 0, vocab_size - 1)
+            full_encodings["input_ids"] = torch.clamp(full_encodings["input_ids"], 0, self.vocab_size - 1)
         
         # Create labels (mask prompt tokens with -100)
         labels = full_encodings["input_ids"].clone()
@@ -487,7 +667,7 @@ class GRPOTrainer:
             labels[i, :prompt_len] = -100
         
         # Validate labels
-        valid_label_mask = (labels >= 0) & (labels < vocab_size)
+        valid_label_mask = (labels >= 0) & (labels < self.vocab_size)
         invalid_labels = (~valid_label_mask & (labels != -100)).sum().item()
         if invalid_labels > 0:
             print(f"WARNING: Found {invalid_labels} invalid label values (not -100 and not in vocab range)")
@@ -497,20 +677,56 @@ class GRPOTrainer:
         # Convert rewards to tensor
         rewards_tensor = torch.tensor(rewards, dtype=torch.float32, device=self.device)
         
-        # Compute advantages
-        advantages = self.compute_advantages(
+        # Debug: Check reward distribution
+        print(f"Debug: Reward statistics")
+        print(f"  Mean: {rewards_tensor.mean().item():.4f}")
+        print(f"  Std: {rewards_tensor.std().item():.4f}")
+        print(f"  Min: {rewards_tensor.min().item():.4f}")
+        print(f"  Max: {rewards_tensor.max().item():.4f}")
+        print(f"  Unique values: {len(rewards_tensor.unique())}")
+        
+        # Check for NaN in rewards
+        if torch.isnan(rewards_tensor).any():
+            raise ValueError("NaN detected in rewards!")
+        
+        # Compute advantages with robust method
+        advantages = self.compute_advantages_robust(
             rewards_tensor,
             self.config.num_generations_per_iter
         )
         
+        # Check advantages
+        print(f"Debug: Advantage statistics")
+        print(f"  Mean: {advantages.mean().item():.4f}")
+        print(f"  Std: {advantages.std().item():.4f}")
+        print(f"  Min: {advantages.min().item():.4f}")
+        print(f"  Max: {advantages.max().item():.4f}")
+        
+        if torch.isnan(advantages).any():
+            raise ValueError("NaN detected in advantages!")
+        
         # Compute reference log probs (memory-efficient with CPU offloading)
+        print(f"Computing reference log probs...")
+
+        # CRITICAL: Aggressive memory cleanup before moving ref model to GPU
+        # This prevents OOM/segfaults with large batches
+        torch.cuda.empty_cache()
+        import gc
+        gc.collect()
+        torch.cuda.synchronize()
+
         ref_log_probs = self.compute_ref_log_probs(
             full_encodings["input_ids"],
             full_encodings["attention_mask"],
             labels,
-            batch_size=2  # Process 2 samples at a time for ref model
+            batch_size=1  # Reduced to 1 to save memory
         )
-        
+
+        # Debug: Check ref log probs range
+        print(f"Reference log probs stats:")
+        print(f"  min={ref_log_probs.min():.2f}, max={ref_log_probs.max():.2f}")
+        print(f"  mean={ref_log_probs.mean():.2f}, std={ref_log_probs.std():.2f}")
+
         # Clear cache after reference computation
         torch.cuda.empty_cache()
         
@@ -545,7 +761,14 @@ class GRPOTrainer:
                 batch_labels,
                 batch_size=1  # Process one at a time for policy model
             )
-            
+
+            # Debug: Check policy log probs
+            if batch_idx == 0:  # Only print for first batch to avoid spam
+                print(f"Policy log probs stats (batch {batch_idx}):")
+                print(f"  min={policy_log_probs.min():.2f}, max={policy_log_probs.max():.2f}")
+                print(f"  mean={policy_log_probs.mean():.2f}, std={policy_log_probs.std():.2f}")
+                print(f"  Compare to ref: diff_mean={(policy_log_probs - batch_ref_log_probs).mean():.2f}")
+
             # Debug: Check if gradients are enabled
             if not policy_log_probs.requires_grad:
                 print(f"ERROR: policy_log_probs does not require grad!")
@@ -704,7 +927,7 @@ def get_kernelbench_problems(level: int = 1) -> List[str]:
 @app.function(
     image=image,
     gpu="L40S",
-    timeout=300,
+    timeout=600,
 )
 def benchmark_kernel(
     kernel_code: str,
@@ -716,29 +939,61 @@ def benchmark_kernel(
 
     Executes in isolated environment with proper error handling
     Uses KernelBench's eval_kernel_against_ref API
+
+    CRITICAL: This function must be extremely robust since it runs in Modal workers.
+    Any uncaught exception during initialization causes Modal to retry 8 times then abort.
     """
     import torch
     import sys
     import traceback
-    
-    # Set up CUDA environment for compilation
-    setup_cuda_environment()
-    
-    sys.path.insert(0, '/root/KernelBench')
-    from src.eval import eval_kernel_against_ref, get_torch_dtype_from_string
-    from src.utils import set_gpu_arch
 
+    # Default result in case of early failure
     result = BenchmarkResult(
         compiles=False,
         correct=False,
-        speedup=0.0
+        speedup=0.0,
+        error_message="Initialization failed"
     )
 
     try:
-        # Set GPU architecture (Ada for L40S)
-        set_gpu_arch(["Ada"])
-        device = torch.device("cuda:0")
+        # Set up CUDA environment for compilation
+        try:
+            setup_cuda_environment()
+        except Exception as setup_error:
+            result.error_message = f"CUDA setup failed: {str(setup_error)[:200]}"
+            print(f"Problem {problem_id} CUDA setup error: {setup_error}")
+            return result
 
+        # Import KernelBench
+        try:
+            sys.path.insert(0, '/root/KernelBench')
+            from src.eval import eval_kernel_against_ref, get_torch_dtype_from_string
+            from src.utils import set_gpu_arch
+        except Exception as import_error:
+            result.error_message = f"KernelBench import failed: {str(import_error)[:200]}"
+            print(f"Problem {problem_id} import error: {import_error}")
+            return result
+
+        # Initialize GPU
+        try:
+            set_gpu_arch(["Ada"])
+            device = torch.device("cuda:0")
+            # Test CUDA is accessible
+            _ = torch.zeros(1, device=device)
+        except Exception as gpu_error:
+            result.error_message = f"GPU initialization failed: {str(gpu_error)[:200]}"
+            print(f"Problem {problem_id} GPU error: {gpu_error}")
+            return result
+
+    except Exception as init_error:
+        # Catch-all for any initialization error
+        result.error_message = f"Benchmark initialization failed: {str(init_error)[:200]}"
+        print(f"Problem {problem_id} CRITICAL initialization error: {init_error}")
+        print(traceback.format_exc())
+        return result
+
+    # Main benchmark execution (GPU and imports already initialized above)
+    try:
         # Use KernelBench's proper evaluation API
         # Capture verbose output to get full error messages
         import io
@@ -746,20 +1001,55 @@ def benchmark_kernel(
         
         # Redirect stderr to capture compilation errors
         stderr_capture = io.StringIO()
-        
-        with contextlib.redirect_stderr(stderr_capture):
-            eval_result = eval_kernel_against_ref(
-                original_model_src=reference_code,
-                custom_model_src=kernel_code,
-                measure_performance=True,
-                verbose=True,  # Enable verbose to see compilation details
-                num_correct_trials=5,
-                num_perf_trials=10,
-                device=device,
-                backend="cuda",
-                precision=get_torch_dtype_from_string("fp32")
-            )
-        
+        from func_timeout import FunctionTimedOut,func_timeout
+        try:
+            with contextlib.redirect_stderr(stderr_capture):
+                eval_result = func_timeout(
+                    timeout=240,
+                    func= eval_kernel_against_ref,
+                    kwargs = {
+                    "original_model_src":reference_code,
+                    "custom_model_src":kernel_code,
+                    "measure_performance":True,
+                    "verbose":False,
+                    "num_correct_trials":3,
+                    "num_perf_trials":5,
+                    "device":device,
+                    "backend":"cuda",
+                    "precision":get_torch_dtype_from_string("fp32")
+                    }
+                )
+        except FunctionTimedOut:
+            result.compiles = False
+            result.correct = False
+            result.error_message = "Evaluation timeout (>4 minutes)"
+            print(f"Problem {problem_id} TIMEOUT in KernelBench evaluation")
+            return result
+        except Exception as eval_error:
+            # CRITICAL: Catch segfaults and runtime errors during kernel execution
+            # This is EXPECTED in early training - model generates buggy kernels
+            stderr_output = stderr_capture.getvalue()
+            error_str = str(eval_error)
+
+            # Check if it's a kernel execution error
+            if "segmentation fault" in error_str.lower() or "segmentation fault" in stderr_output.lower():
+                result.compiles = True  # It compiled but crashed at runtime
+                result.correct = False
+                result.error_message = "Kernel segfault during execution (buggy generated code)"
+                print(f"Problem {problem_id} SEGFAULT during execution (this is normal in early training)")
+            elif "cuda" in error_str.lower() or "cuda" in stderr_output.lower():
+                result.compiles = True  # Likely compiled but CUDA runtime error
+                result.correct = False
+                result.error_message = f"CUDA runtime error: {error_str[:200]}"
+                print(f"Problem {problem_id} CUDA error: {error_str[:100]}")
+            else:
+                # Other error during evaluation
+                result.compiles = False
+                result.correct = False
+                result.error_message = f"Evaluation error: {error_str[:200]}"
+                print(f"Problem {problem_id} evaluation error: {error_str[:100]}")
+
+            return result
         # Get captured stderr
         stderr_output = stderr_capture.getvalue()
         if stderr_output:
@@ -840,28 +1130,67 @@ def compute_fast_p(results: List[BenchmarkResult], p: float) -> float:
 
     return fast_and_correct / total
 
-def compute_reward(result: BenchmarkResult, config: TrainingConfig) -> float:
+def compute_reward(result: BenchmarkResult, completion: str, config: TrainingConfig) -> float:
     """
-    Compute scalar reward from benchmark result
+    Compute scalar reward with multiple reward levels to provide training signal
+    even when kernels don't compile or crash during execution
 
-    Reward components:
-    1. Compilation success (partial credit)
-    2. Correctness (major component)
-    3. Speedup (performance bonus)
+    Reward structure (cumulative):
+    - Level 0: Valid output format (0.05)
+    - Level 1: Contains code block (0.10)
+    - Level 2: Code has CUDA keywords (0.15)
+    - Level 3: Compiles successfully (0.20)
+    - Level 4: Passes correctness tests (0.50)
+    - Level 5: Performance speedup (0.30 * normalized_speedup)
+
+    Special cases:
+    - Segfault/runtime crash: Gets compilation reward but penalty for crash (-0.10)
+    - This teaches model that syntax is good but logic is bad
+
+    Maximum possible reward: 1.30
     """
     reward = 0.0
-
-    # Compilation reward
+    
+    # Level 0: Non-empty output (basic sanity check)
+    if completion and len(completion.strip()) > 10:
+        reward += 0.05
+    else:
+        # Penalty for empty/trivial output
+        return -0.1
+    
+    # Level 1: Contains code block
+    if "```" in completion:
+        reward += 0.10
+    
+    # Level 2: Check for CUDA-specific keywords (code quality proxy)
+    cuda_keywords = ["__global__", "__device__", "<<<", ">>>", "threadIdx", "blockIdx", "cudaMalloc", "__shared__"]
+    cuda_keyword_count = sum(1 for kw in cuda_keywords if kw in completion)
+    if cuda_keyword_count > 0:
+        # Reward proportional to CUDA keyword presence (up to 0.15)
+        reward += min(0.15, cuda_keyword_count * 0.03)
+    
+    # Level 3: Compilation success
     if result.compiles:
         reward += config.reward_compilation
 
-    # Correctness reward
+        # Check if it compiled but crashed at runtime (segfault/CUDA error)
+        if not result.correct and result.error_message:
+            if "segfault" in result.error_message.lower() or "cuda runtime error" in result.error_message.lower():
+                # Kernel compiled but crashed - penalize but less than compilation failure
+                # This provides gradient: syntax ok (0.20) but logic bad (-0.10) = net 0.10
+                reward -= 0.10
+    else:
+        # Compilation failure - larger penalty to guide away from invalid syntax
+        reward -= 0.05
+
+    # Level 4: Correctness
     if result.correct:
         reward += config.reward_correctness
 
-        # Speedup bonus (only if correct)
-        normalized_speedup = min(result.speedup / config.speedup_target, 1.0)
-        reward += config.reward_speedup * normalized_speedup
+        # Level 5: Speedup bonus (only if correct)
+        if result.speedup > 0:
+            normalized_speedup = min(result.speedup / config.speedup_target, 2.0)  # Cap at 2x target
+            reward += config.reward_speedup * normalized_speedup
 
     return reward
 
@@ -1179,6 +1508,26 @@ def train_online_grpo():
         config.model_name,
         trust_remote_code=True
     )
+    
+    # CRITICAL: Get actual vocab size from model config
+    # tokenizer.vocab_size may not include all special tokens
+    actual_vocab_size = model.config.vocab_size
+    print(f"Tokenizer vocab_size: {tokenizer.vocab_size}")
+    print(f"Model config vocab_size: {actual_vocab_size}")
+    print(f"Tokenizer length: {len(tokenizer)}")
+
+    # Check embedding layer for NaN
+    print("\nChecking embedding layer for NaN...")
+    if hasattr(model, 'get_input_embeddings'):
+        embed_layer = model.get_input_embeddings()
+        if hasattr(embed_layer, 'weight'):
+            embed_weight = embed_layer.weight
+            if torch.isnan(embed_weight).any():
+                print(f"ERROR: Found NaN in embedding layer!")
+                raise RuntimeError("Embedding layer contains NaN")
+            print(f"✓ Embedding layer OK: shape={embed_weight.shape}, dtype={embed_weight.dtype}")
+            print(f"  Embedding stats: min={embed_weight.min():.4f}, max={embed_weight.max():.4f}")
+    
     if hasattr(model, 'enable_input_require_grads'):
         model.enable_input_require_grads()
     # Ensure tokenizer has pad token
@@ -1198,6 +1547,76 @@ def train_online_grpo():
     )
     model = get_peft_model(model, peft_config)
     model.print_trainable_parameters()
+
+    # Load checkpoint if resuming training
+    if config.load_checkpoint is not None:
+        checkpoint_iter = config.load_checkpoint
+        checkpoint_path = f"/checkpoints/iteration_{checkpoint_iter}"
+        if os.path.exists(checkpoint_path):
+            print(f"\n{'='*60}")
+            print(f"LOADING CHECKPOINT from iteration {checkpoint_iter}")
+            print(f"{'='*60}\n")
+            # Use safetensors for loading (PEFT saves in safetensors format by default)
+            from safetensors.torch import load_file
+            adapter_file = f"{checkpoint_path}/adapter_model.safetensors"
+            if os.path.exists(adapter_file):
+                state_dict = load_file(adapter_file)
+                model.load_state_dict(state_dict, strict=False)
+                print(f"✓ Loaded adapter weights from {adapter_file}")
+            else:
+                print(f"⚠️  No adapter weights found at {adapter_file}, will train from scratch")
+        else:
+            print(f"No checkpoint found at {checkpoint_path}, starting from scratch")
+    # After applying LoRA and before training, add this test:
+    print("\nChecking for NaN in model parameters...")
+    nan_params = []
+    extreme_params = []
+    for name, param in model.named_parameters():
+        if torch.isnan(param).any():
+            nan_params.append(name)
+        # Check for extreme values that could cause NaN
+        if torch.isinf(param).any():
+            extreme_params.append((name, "inf"))
+        elif param.abs().max() > 1e4:
+            extreme_params.append((name, f"large:{param.abs().max().item():.2e}"))
+
+    if nan_params:
+        print(f"ERROR: Found NaN in {len(nan_params)} parameters:")
+        for name in nan_params[:10]:  # Show first 10
+            print(f"  - {name}")
+        raise RuntimeError("Model has NaN parameters before training!")
+
+    if extreme_params:
+        print(f"WARNING: Found {len(extreme_params)} parameters with extreme values:")
+        for name, val in extreme_params[:5]:
+            print(f"  - {name}: {val}")
+        # Reinitialize LoRA adapters with smaller scale
+        print("  Re-initializing LoRA adapters with smaller scale...")
+        for name, module in model.named_modules():
+            if 'lora_A' in name and hasattr(module, 'weight'):
+                if isinstance(module.weight, torch.Tensor):
+                    torch.nn.init.normal_(module.weight, mean=0.0, std=0.01)
+            elif 'lora_B' in name and hasattr(module, 'weight'):
+                if isinstance(module.weight, torch.Tensor):
+                    torch.nn.init.zeros_(module.weight)
+    else:
+        print("✓ All model parameters are valid (no NaN, no extreme values)")
+        # CRITICAL: Disable gradient checkpointing for LoRA training
+    # It causes NaN with mixed precision
+    if hasattr(model, 'gradient_checkpointing_disable'):
+        model.gradient_checkpointing_disable()
+        print("✓ Gradient checkpointing DISABLED for GRPO training (prevents NaN)")
+    elif hasattr(model, 'is_gradient_checkpointing'):
+        print(f"WARNING: Cannot disable gradient checkpointing. Current state: {model.is_gradient_checkpointing}")
+    
+    # Verify gradient checkpointing is actually disabled
+    if hasattr(model.base_model, 'model'):
+        base = model.base_model.model
+        if hasattr(base, 'gradient_checkpointing'):
+            if base.gradient_checkpointing:
+                print("ERROR: Gradient checkpointing is still enabled on base model!")
+                base.gradient_checkpointing = False
+                print("  Force-disabled gradient checkpointing")
     
     # Verify LoRA is configured correctly
     print(f"LoRA configuration:")
@@ -1268,9 +1687,30 @@ def train_online_grpo():
         tokenizer=tokenizer,
         config=config,
         optimizer=optimizer,
-        device=device
+        device=device,
+        vocab_size=actual_vocab_size  # Pass vocab size for token validation
     )
+    # TEST: Verify model can do forward pass without NaN
+    print("\nTesting forward pass for NaN detection...")
+    test_input = tokenizer("Hello world", return_tensors="pt").to(device)
+    model.eval()  # Temporarily set to eval for test
+    with torch.no_grad():
+        test_output = model(**test_input)
+        test_logits = test_output.logits
+        
+        if torch.isnan(test_logits).any():
+            print("❌ ERROR: NaN in logits during test forward pass!")
+            print("  This indicates model weights or configuration issue")
+            raise RuntimeError("Model produces NaN in forward pass")
+        elif torch.isinf(test_logits).any():
+            print("⚠️  WARNING: Inf in logits during test forward pass")
+            print(f"  Logits range: [{test_logits.min():.2f}, {test_logits.max():.2f}]")
+        else:
+            print(f"✓ Test forward pass OK. Logits range: [{test_logits.min():.2f}, {test_logits.max():.2f}]")
     
+    model.train()  # Back to training mode
+    del test_input, test_output, test_logits
+    torch.cuda.empty_cache()
     # Start vLLM server on GPU 0 for fast generation
     print("Starting vLLM server...")
     import time
@@ -1411,23 +1851,84 @@ def train_online_grpo():
         # Phase 2: BENCHMARKING
         print("Phase 2: Benchmarking kernels in parallel...")
         
+        # Aggressively clear CUDA cache before benchmarking
+        print("Clearing CUDA memory before benchmarking...")
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        print_gpu_memory_summary(1)
+        
         # Extract code for benchmarking
         all_codes = [extract_last_code(comp, ["python", "cpp"]) or "" for comp in all_completions]
-        
-        # Parallel benchmark execution
-        benchmark_results = list(benchmark_kernel.starmap(
-            zip(
-                all_codes,
-                all_references,
-                all_problem_ids
-            )
-        ))
+
+        # CRITICAL: Batch benchmark execution to prevent Modal worker overload
+        # Processing all 30 benchmarks at once can cause worker initialization failures
+        print(f"Benchmarking {len(all_codes)} kernels in batches...")
+        benchmark_results = []
+        batch_size = 10  # Process 10 benchmarks at a time
+
+        for batch_idx in range(0, len(all_codes), batch_size):
+            batch_end = min(batch_idx + batch_size, len(all_codes))
+            batch_codes = all_codes[batch_idx:batch_end]
+            batch_refs = all_references[batch_idx:batch_end]
+            batch_ids = all_problem_ids[batch_idx:batch_end]
+
+            print(f"  Batch {batch_idx//batch_size + 1}/{(len(all_codes) + batch_size - 1)//batch_size}: problems {batch_idx} to {batch_end-1}")
+
+            try:
+                batch_results = list(benchmark_kernel.starmap(
+                    zip(batch_codes, batch_refs, batch_ids)
+                ))
+                benchmark_results.extend(batch_results)
+                print(f"  Batch completed: {len(batch_results)} benchmarks")
+            except Exception as batch_error:
+                print(f"  ERROR: Batch failed: {batch_error}")
+                print(f"  Creating fallback results for batch...")
+                # Create fallback results for failed batch
+                for code, ref, pid in zip(batch_codes, batch_refs, batch_ids):
+                    fallback = BenchmarkResult(
+                        compiles=False,
+                        correct=False,
+                        speedup=0.0,
+                        error_message=f"Batch benchmark failed: {str(batch_error)[:200]}"
+                    )
+                    benchmark_results.append(fallback)
+                print(f"  Added {len(batch_codes)} fallback results")
+
+            # Small delay between batches to avoid overwhelming Modal
+            import time
+            time.sleep(2)
         
         # Clear cache after benchmarking
         torch.cuda.empty_cache()
         
-        # Compute rewards
-        rewards = [compute_reward(result, config) for result in benchmark_results]
+        rewards = [
+        compute_reward(result, completion, config) 
+            for result, completion in zip(benchmark_results, all_completions)
+        ]
+
+        # Debug rewards
+        print(f"Rewards statistics:")
+        print(f"  Mean: {np.mean(rewards):.4f}")
+        print(f"  Std: {np.std(rewards):.4f}")
+        print(f"  Min: {np.min(rewards):.4f}, Max: {np.max(rewards):.4f}")
+        print(f"  Unique rewards: {len(set(rewards))}")
+        print(f"  Zero rewards: {sum(1 for r in rewards if abs(r) < 0.01)}/{len(rewards)}")
+        print(f"  Negative rewards: {sum(1 for r in rewards if r < 0)}/{len(rewards)}")
+
+        # Check for all-zero or all-identical rewards
+        if len(set(rewards)) == 1:
+            print("WARNING: All rewards are identical!")
+            if all(r == 0 for r in rewards):
+                print("  All rewards are ZERO - this is problematic!")
+                print("  The model will receive no learning signal")
+            print("  Adding small random noise to break ties...")
+            # Add noise proportional to reward scale
+            noise_scale = max(0.01, np.std(rewards) * 0.1)
+            rewards = [r + np.random.normal(0, noise_scale) for r in rewards]
+            print(f"  After noise - Std: {np.std(rewards):.4f}")
 
         # Log statistics
         num_compiled = sum(1 for r in benchmark_results if r.compiles)
