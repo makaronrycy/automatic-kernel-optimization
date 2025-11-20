@@ -1,0 +1,32 @@
+{
+  "iteration": 30,
+  "compilation_rate": 0.25,
+  "correctness_rate": 0.1,
+  "avg_speedup": 0.7669740504313899,
+  "avg_reward": -0.9066512974784307,
+  "speedup_distribution": [
+    0.9768722466960351,
+    0.6978417266187049,
+    0.6978417266187049,
+    0.6953405017921147
+  ],
+  "fast_p_scores": {
+    "fast_p_0.0": 0.1,
+    "fast_p_0.5": 0.1,
+    "fast_p_0.8": 0.025,
+    "fast_p_1.0": 0.0,
+    "fast_p_1.5": 0.0,
+    "fast_p_2.0": 0.0
+  },
+  "training_history": {
+    "policy_loss": [
+      0.029402508214116097
+    ],
+    "kl_div": [
+      0.23536072187125684
+    ],
+    "total_loss": [
+      0.034109726548194885
+    ]
+  }
+}

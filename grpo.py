@@ -13,7 +13,7 @@ Custom GRPO implementation without TRL dependency.
 import modal
 import torch
 import torch.nn.functional as F
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional
 import json
 import subprocess
@@ -21,7 +21,19 @@ import tempfile
 import os
 import re
 import numpy as np
+# Add to imports at the top
+from torch.profiler import profile, ProfilerActivity, schedule
 
+# Add new dataclass for profiling results
+@dataclass
+class ProfilingResult:
+    """Results from PyTorch profiler"""
+    cpu_time_total: float = 0.0
+    cuda_time_total: float = 0.0
+    cpu_memory_usage: int = 0
+    cuda_memory_usage: int = 0
+    kernel_names: List[str] = field(default_factory=list)
+    trace_path: str = ""
 # ============================================================================
 # MODAL SETUP
 # ============================================================================
@@ -79,48 +91,48 @@ results_vol = modal.Volume.from_name("grpo-results", create_if_missing=True)
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-
 @dataclass
 class TrainingConfig:
-    """Online GRPO training configuration"""
+    """Online GRPO training configuration - FIXED"""
     
     # Model
     model_name: str = "Qwen/Qwen2.5-Coder-7B-Instruct"
     
     # Online RL parameters
-    num_training_iterations: int = 50  # How many generate-train cycles
-    num_generations_per_iter: int = 5  # Completions per prompt per iteration (reduced to prevent OOM)
-    problems_per_iter: int = 6  # How many problems to sample each iteration (30 total samples)
+    num_training_iterations: int = 100  # ← Zwiększ, będziesz potrzebować więcej
+    num_generations_per_iter: int = 4   # ← ZMNIEJSZ do 4 (lepsza jakość grup)
+    problems_per_iter: int = 10         # ← ZWIĘKSZ do 10 (40 sampli total)
     
     # GRPO parameters
-    learning_rate: float = 1e-6
-    grpo_epsilon: float = 0.2  # Clipping parameter
-    grpo_beta: float = 0.1  # KL penalty coefficient (increased from 0.01 to prevent divergence)
+    learning_rate: float = 3e-5         # ← 30x WIĘCEJ!
+    grpo_epsilon: float = 0.2           # ← OK
+    grpo_beta: float = 0.02             # ← 5x MNIEJ!
     
     # Generation parameters
-    max_prompt_length: int = 1024
-    max_completion_length: int = 2048
-    temperature: float = 0.7
+    max_prompt_length: int = 1024       # ← OK
+    max_completion_length: int = 1536   # ← Trochę mniej (kernele rzadko > 1500 tokens)
+    temperature: float = 0.85           # ← Więcej eksploracji
     
     # Training parameters
-    mini_epochs: int = 1  # Reduced to 1 for memory efficiency
-    batch_size: int = 1
-    gradient_accumulation_steps: int = 4  # Reduced from 8
-    max_grad_norm: float = 1.0
+    mini_epochs: int = 1                # ← OK dla online RL
+    batch_size: int = 1                 # ← OK
+    gradient_accumulation_steps: int = 4 # ← OK
+    max_grad_norm: float = 1.0          # ← OK
     
     # LoRA configuration
-    lora_r: int = 64
-    lora_alpha: int = 64
-    lora_dropout: float = 0.0  # CHANGED: Disabled dropout to prevent NaN with bfloat16
+    lora_r: int = 64                    # ← OK
+    lora_alpha: int = 64                # ← OK
+    lora_dropout: float = 0.0           # ← OK
     
     # Checkpointing
-    save_every_n_iters: int = 10
-    load_checkpoint: int = 10  # Load checkpoint from this iteration, or None
-    # Reward weights
-    reward_compilation: float = 0.2
-    reward_correctness: float = 0.5
-    reward_speedup: float = 0.3
-    speedup_target: float = 2.0  # Normalize speedups to this value
+    save_every_n_iters: int = 10        # ← OK
+    load_checkpoint: int = 40         # ← Start od nowa z nowymi settings
+    
+    # Reward weights - FIXED VERSION
+    reward_compilation: float = -1.0    # ← PENALTY za fail
+    reward_correctness: float = 1.0     # ← BASE reward za poprawność
+    reward_speedup: float = 2.0         # ← BONUS za performance
+    speedup_target: float = 2.0         # ← OK
 
 
 
@@ -928,6 +940,7 @@ def get_kernelbench_problems(level: int = 1) -> List[str]:
     image=image,
     gpu="L40S",
     timeout=600,
+    max_containers=2
 )
 def benchmark_kernel(
     kernel_code: str,
@@ -946,7 +959,10 @@ def benchmark_kernel(
     import torch
     import sys
     import traceback
-
+    import gc
+    # CRITICAL: Aggressive memory cleanup BEFORE loading
+    torch.cuda.empty_cache()
+    gc.collect()
     # Default result in case of early failure
     result = BenchmarkResult(
         compiles=False,
@@ -1033,7 +1049,7 @@ def benchmark_kernel(
 
             # Check if it's a kernel execution error
             if "segmentation fault" in error_str.lower() or "segmentation fault" in stderr_output.lower():
-                result.compiles = True  # It compiled but crashed at runtime
+                result.compiles = False  # It compiled but crashed at runtime
                 result.correct = False
                 result.error_message = "Kernel segfault during execution (buggy generated code)"
                 print(f"Problem {problem_id} SEGFAULT during execution (this is normal in early training)")
@@ -1050,7 +1066,7 @@ def benchmark_kernel(
                 print(f"Problem {problem_id} evaluation error: {error_str[:100]}")
 
             return result
-        # Get captured stderr
+        
         stderr_output = stderr_capture.getvalue()
         if stderr_output:
             print(f"Compilation output for problem {problem_id}:")
@@ -1103,15 +1119,22 @@ def benchmark_kernel(
             print(f"Problem {problem_id} incorrect: {result.error_message[:200]}")
         else:
             print(f"Problem {problem_id} SUCCESS: speedup={result.speedup:.2f}x")
-
         return result
-
     except Exception as e:
         error_trace = traceback.format_exc()
         result.error_message = f"Unexpected error: {str(e)}\n{error_trace[:500]}"
         print(f"Problem {problem_id} exception: {result.error_message}")
         return result
+    # Get captured stderr
+    finally:
+        # CRITICAL: Clear everything immediately
+        torch.cuda.empty_cache()
+        gc.collect()
 
+        # Force delete any cached models
+        if 'eval_result' in locals():
+            del eval_result
+        
 def compute_fast_p(results: List[BenchmarkResult], p: float) -> float:
     """
     Compute fast_p metric: fraction of samples that are correct AND have speedup > p
@@ -1132,66 +1155,45 @@ def compute_fast_p(results: List[BenchmarkResult], p: float) -> float:
 
 def compute_reward(result: BenchmarkResult, completion: str, config: TrainingConfig) -> float:
     """
-    Compute scalar reward with multiple reward levels to provide training signal
-    even when kernels don't compile or crash during execution
-
-    Reward structure (cumulative):
-    - Level 0: Valid output format (0.05)
-    - Level 1: Contains code block (0.10)
-    - Level 2: Code has CUDA keywords (0.15)
-    - Level 3: Compiles successfully (0.20)
-    - Level 4: Passes correctness tests (0.50)
-    - Level 5: Performance speedup (0.30 * normalized_speedup)
-
-    Special cases:
-    - Segfault/runtime crash: Gets compilation reward but penalty for crash (-0.10)
-    - This teaches model that syntax is good but logic is bad
-
-    Maximum possible reward: 1.30
+    Simple 3-level reward structure optimized for GRPO
+    
+    Philosophy: Strong penalties guide syntax learning,
+    strong bonuses guide optimization learning
     """
-    reward = 0.0
     
-    # Level 0: Non-empty output (basic sanity check)
-    if completion and len(completion.strip()) > 10:
-        reward += 0.05
-    else:
-        # Penalty for empty/trivial output
-        return -0.1
+    # Sanity: non-empty output
+    if not completion or len(completion.strip()) < 20:
+        return -2.0
     
-    # Level 1: Contains code block
-    if "```" in completion:
-        reward += 0.10
+    # Level 1: Compilation (critical gate)
+    if not result.compiles:
+        return -1.0  # Strong penalty teaches syntax
     
-    # Level 2: Check for CUDA-specific keywords (code quality proxy)
-    cuda_keywords = ["__global__", "__device__", "<<<", ">>>", "threadIdx", "blockIdx", "cudaMalloc", "__shared__"]
-    cuda_keyword_count = sum(1 for kw in cuda_keywords if kw in completion)
-    if cuda_keyword_count > 0:
-        # Reward proportional to CUDA keyword presence (up to 0.15)
-        reward += min(0.15, cuda_keyword_count * 0.03)
+    # Compiled but crashed at runtime
+    if not result.correct and result.error_message:
+        if any(x in result.error_message.lower() 
+               for x in ["segfault", "cuda runtime error", "illegal memory", "cuda error"]):
+            return -0.5  # Syntax OK, logic bad
     
-    # Level 3: Compilation success
-    if result.compiles:
-        reward += config.reward_compilation
-
-        # Check if it compiled but crashed at runtime (segfault/CUDA error)
-        if not result.correct and result.error_message:
-            if "segfault" in result.error_message.lower() or "cuda runtime error" in result.error_message.lower():
-                # Kernel compiled but crashed - penalize but less than compilation failure
-                # This provides gradient: syntax ok (0.20) but logic bad (-0.10) = net 0.10
-                reward -= 0.10
-    else:
-        # Compilation failure - larger penalty to guide away from invalid syntax
-        reward -= 0.05
-
-    # Level 4: Correctness
-    if result.correct:
-        reward += config.reward_correctness
-
-        # Level 5: Speedup bonus (only if correct)
-        if result.speedup > 0:
-            normalized_speedup = min(result.speedup / config.speedup_target, 2.0)  # Cap at 2x target
-            reward += config.reward_speedup * normalized_speedup
-
+    # Level 2: Correctness (second gate)
+    if not result.correct:
+        return -0.3  # Compiles but wrong output
+    
+    # Level 3: Performance (only for correct kernels)
+    # Base reward for correctness
+    reward = 1.0
+    
+    if result.speedup > 0:
+        if result.speedup >= 1.0:
+            # Beat baseline: exponential bonus
+            # 1.0x → +1.0, 1.5x → +1.5, 2.0x → +2.0, 3.0x → +3.0
+            normalized = min(result.speedup / config.speedup_target, 1.5)
+            reward += normalized * 2.0
+        else:
+            # Below baseline: small bonus for being close
+            # 0.5x → +0.25, 0.8x → +0.4, 0.95x → +0.475
+            reward += result.speedup * 0.5
+    
     return reward
 
 def extract_last_code(output_string: str, code_language_types: list[str]) -> str | None:
@@ -2078,7 +2080,14 @@ def optimize_kernel(
         torch_dtype=torch.bfloat16,
         device_map="auto"
     )
+ 
     model = PeftModel.from_pretrained(base_model, checkpoint_path)
+    from safetensors.torch import load_file
+    adapter_file = f"{checkpoint_path}/adapter_model.safetensors"
+    if os.path.exists(adapter_file):
+        state_dict = load_file(adapter_file)
+        model.load_state_dict(state_dict, strict=False)
+        print(f"✓ Loaded adapter weights from {adapter_file}")
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B-Instruct")
     
     # Generate optimized kernel

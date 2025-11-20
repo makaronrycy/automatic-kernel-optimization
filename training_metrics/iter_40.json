@@ -1,0 +1,27 @@
+{
+  "iteration": 40,
+  "compilation_rate": 0.0,
+  "correctness_rate": 0.0,
+  "avg_speedup": 0.0,
+  "avg_reward": -1.275,
+  "speedup_distribution": [],
+  "fast_p_scores": {
+    "fast_p_0.0": 0.0,
+    "fast_p_0.5": 0.0,
+    "fast_p_0.8": 0.0,
+    "fast_p_1.0": 0.0,
+    "fast_p_1.5": 0.0,
+    "fast_p_2.0": 0.0
+  },
+  "training_history": {
+    "policy_loss": [
+      -0.036119110975414516
+    ],
+    "kl_div": [
+      0.23503444492816924
+    ],
+    "total_loss": [
+      -0.031418423354625705
+    ]
+  }
+}
